@@ -1,0 +1,5 @@
+- Turn on camera, run main loop which calls all the other functions
+- Detect 4 people in frame, assign them IDs, and have it stick with them even if they move 
+- Detect arms and legs, or face
+- Establish bounds for movement (modifiable thresholds) and determine when people move, flag it with a different colored bounding box
+- Ability to control when detection is on or off (functionally the eye implemented in software)
