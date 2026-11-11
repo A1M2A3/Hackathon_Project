@@ -1,0 +1,38 @@
+model:
+  weights: yolo26n-pose.pt
+
+camera:
+  source: 0
+  width: 1280
+  height: 720
+  fps_target: 30
+  max_people: 4
+
+detection:
+  confidence: 0.40
+  image_size: 640
+  keypoint_confidence: 0.35
+
+tracking:
+  tracker: bytetrack.yaml
+
+walking:
+  history_seconds: 1.0
+
+  minimum_comparison_seconds: 0.5
+
+  min_keypoint_confidence: 0.50
+
+  # Normalized displacement thresholds
+  movement_threshold: 0.08
+  stop_threshold: 0.03
+
+  # Required duration of movement
+  confirmation_seconds: 0.25
+
+  # Remove inactive tracking histories
+  lost_track_seconds: 2.0
+
+display:
+  show_skeleton: true
+  show_person_id: true

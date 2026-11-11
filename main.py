@@ -1,82 +1,117 @@
-
-from collections import defaultdict, deque
+import cv2                          # detects 4 players and flags if they move
+import yaml
 import time
-
-import cv2
 from ultralytics import YOLO
 
-# Pose model performs person detection and joint estimation.
-model = YOLO("yolo11n-pose.pt")
+from walking_detector import WalkingDetector
 
-# One independent history per tracked person.
-pose_history = defaultdict(lambda: deque(maxlen=60))
+SKELETON = [
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16)
+]
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-cap.set(cv2.CAP_PROP_FPS, 30)
+def draw_pose(frame, points, confidence, threshold=0.35):
+    """Draw COCO-17 keypoints and limb connections."""
+    for a, b in SKELETON:
+        if confidence[a] >= threshold and confidence[b] >= threshold:
+            p1 = tuple(points[a].astype(int))
+            p2 = tuple(points[b].astype(int))
+            cv2.line(frame, p1, p2, (255, 180, 0), 2)
 
-if not cap.isOpened():
-    raise RuntimeError("Could not open webcam")
+    for i, point in enumerate(points):
+        if confidence[i] >= threshold:
+            cv2.circle(frame, tuple(point.astype(int)), 3, (255, 255, 255), -1)
 
-previous_time = time.perf_counter()
+def main():
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
 
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
+    model = YOLO(cfg["model"]["weights"])
+    walker = WalkingDetector(cfg["walking"])
 
-    results = model.track(
-        frame,
-        persist=True,
-        tracker="bytetrack.yaml",
-        imgsz=640,
-        conf=0.35,
-        verbose=False
-    )
+    cap = cv2.VideoCapture(cfg["camera"]["source"])
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg["camera"]["width"])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg["camera"]["height"])
+    cap.set(cv2.CAP_PROP_FPS, cfg["camera"]["fps_target"])
 
-    result = results[0]
+    if not cap.isOpened():
+        raise RuntimeError("Could not open camera. Check camera.source in config.yaml.")
 
-    if result.keypoints is not None:
-        keypoints = result.keypoints.xy.cpu().numpy()
-        ids = (
-            result.boxes.id.int().cpu().tolist()
-            if result.boxes is not None
-            and result.boxes.id is not None
-            else [None] * len(keypoints)
-        )
+    print("Cyclops running. Press Q to quit.")
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("Could not read a frame from the camera.")
+                break
 
-        for person_id, joints in zip(ids, keypoints):
-            if person_id is None:
-                continue
+            now = time.monotonic()
+            results = model.track(
+                frame,
+                persist=True,
+                tracker=cfg["tracking"]["tracker"],
+                classes=[0],                  # COCO class 0 = person
+                conf=cfg["detection"]["confidence"],
+                imgsz=cfg["detection"]["image_size"],
+                max_det=cfg["camera"]["max_people"],
+                verbose=False
+            )
+            result = results[0]
 
-            pose_history[person_id].append(joints)
+            if result.boxes is not None and result.keypoints is not None:
+                boxes = result.boxes
+                keypoints = result.keypoints.data.cpu().numpy()
 
-            # TODO: classify_action() should analyze the
-            # rolling joint history, not a single frame.
-            # action, confidence = classify_action(
-            #     list(pose_history[person_id])
-            # )
+                if boxes.id is not None:
+                    ids = boxes.id.int().cpu().tolist()
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    for i, track_id in enumerate(ids):
+                        x1, y1, x2, y2 = xyxy[i].astype(int)
+                        box_height = max(1, y2 - y1)
+                        pose = keypoints[i]
+                        points = pose[:, :2]
+                        kp_conf = pose[:, 2] if pose.shape[1] > 2 else [1.0] * len(pose)
 
-    annotated = result.plot()
+                        state = walker.update(
+                            track_id=track_id,
+                            points=points,
+                            keypoint_conf=kp_conf,
+                            bbox=(x1, y1, x2, y2),
+                            timestamp=now
+                        )
 
-    now = time.perf_counter()
-    fps = 1.0 / max(now - previous_time, 1e-6)
-    previous_time = now
+                        motion_state = state["state"]
 
-    cv2.putText(
-        annotated, f"Loop FPS: {fps:.1f}",
-        (15, 30), cv2.FONT_HERSHEY_SIMPLEX,
-        0.8, (0, 255, 0), 2
-    )
+                        if motion_state == "MOVING":
+                            color = (0, 0, 255)
+                        elif motion_state == "STATIONARY":
+                            color = (0, 200, 0)
+                        else:
+                            color = (0, 255, 255)
 
-    cv2.imshow("Person Action Tracker", annotated)
+                        label = f"ID {track_id}: {motion_state}"
 
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(frame, label, (x1, max(25, y1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-cap.release()
-cv2.destroyAllWindows()
+                        if cfg["display"]["show_skeleton"]:
+                            draw_pose(frame, points, kp_conf,
+                                      cfg["detection"]["keypoint_confidence"])
 
+            walker.cleanup(now)
 
+            cv2.putText(frame, f"People tracked: {len(result.boxes) if result.boxes is not None else 0}/"
+                               f"{cfg['camera']['max_people']}",
+                        (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.imshow("Cyclops - Person Walking Detection", frame)
 
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
