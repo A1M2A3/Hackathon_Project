@@ -3,6 +3,8 @@ import yaml
 import time
 from ultralytics import YOLO
 import random
+import queue
+from pytrinamic.connections import UsbTmclInterface
 
 from walking_detector import WalkingDetector    
 
@@ -55,97 +57,134 @@ def get_detection_roi(position_deg, frame_width, frame_height):
 
     return x1, 0, x2, frame_height
 
-def main():
+
+def main(motor, stop_event, continue_event, frame_queue, messages):
+    # TMCL command opcodes
+    MST = 3
+    MVP = 4
+    SAP = 5
+    GAP = 6
+    RFS = 13
+    
     with open("config.yaml", "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model = YOLO(cfg["model"]["weights"])
     walker = WalkingDetector(cfg["walking"])
-
     previous_states = {}
 
-    #cap = cv2.VideoCapture(cfg["camera"]["source"])
     cap = cv2.VideoCapture(cfg["camera"]["source"], cv2.CAP_DSHOW)
-
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg["camera"]["width"])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg["camera"]["height"])
     cap.set(cv2.CAP_PROP_FPS, cfg["camera"]["fps_target"])
 
     if not cap.isOpened():
-        raise RuntimeError("Could not open camera. Check camera.source in config.yaml.")
+        messages.put("ERROR: Could not open camera.")
+        return
 
-    print("Cyclops running. Press Q to quit.")
+    messages.put("Cyclops running.")
 
-    motor = Motor(COM_PORT,0,microsteps_per_deg)
     motor_position = 0
     last_motor_read = 0
     motor_stopped = False
 
-    try:
-        while True:
-            response = motor.send_command(6, 8, 0)                  # checks if motor reached the current target position
-            
-            if response.is_valid:               
-                if response.value == 1 or motor_stopped:                             # if motor is at target position, generates a new target position
-                    motor_stopped = False
-                    new_pos = random.randint(10,80)
-                    response = motor.send_command(4, 0, motor.angle_to_steps(new_pos)) 
+    def send_frame(frame):
+        """Keep only the newest live camera frame in the queue."""
+        try:
+            frame_queue.put_nowait(frame.copy())
+        except queue.Full:
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                pass
 
+            try:
+                frame_queue.put_nowait(frame.copy())
+            except queue.Full:
+                pass
+
+    try:
+        while not stop_event.is_set():
+
+            # Check whether the motor has reached its target
+            response = motor.send_command(6, 8, 0)
+
+            if response.is_valid:
+                if response.value == 1 or motor_stopped:
+
+                    motor_stopped = False
+                    new_pos = random.randint(10, 80)
+
+                    motor.send_command(
+                        MVP, 0, motor.angle_to_steps(new_pos)
+                    )
+
+            # Read camera frame
             ok, frame = cap.read()
+
             if not ok:
-                print("Could not read a frame from the camera.")
+                messages.put("ERROR: Could not read camera frame.")
                 break
 
             now = time.monotonic()
 
-            # Update motor position every 100 ms
+            # Read motor position every 100 ms
             if now - last_motor_read >= 0.1:
                 motor_position = motor.get_position()
                 last_motor_read = now
 
             h, w = frame.shape[:2]
 
-            roi_x1, roi_y1, roi_x2, roi_y2 = get_detection_roi(                     # gets the window of interest based on motor position
-            motor_position, w, h
+            roi_x1, roi_y1, roi_x2, roi_y2 = get_detection_roi(
+                motor_position, w, h
             )
 
+            # Run YOLO tracking
             results = model.track(
                 frame,
                 persist=True,
                 tracker=cfg["tracking"]["tracker"],
-                classes=[0],                  # COCO class 0 = person
+                classes=[0],
                 conf=cfg["detection"]["confidence"],
                 imgsz=cfg["detection"]["image_size"],
                 max_det=cfg["camera"]["max_people"],
                 verbose=False
             )
+
             result = results[0]
 
             if result.boxes is not None and result.keypoints is not None:
+
                 boxes = result.boxes
                 keypoints = result.keypoints.data.cpu().numpy()
 
                 if boxes.id is not None:
+
                     ids = boxes.id.int().cpu().tolist()
                     xyxy = boxes.xyxy.cpu().numpy()
+
                     for i, track_id in enumerate(ids):
+
                         x1, y1, x2, y2 = xyxy[i].astype(int)
 
-                        # Calculate centre of detected person
                         center_x = (x1 + x2) // 2
                         center_y = (y1 + y2) // 2
 
-                        # Ignore detections outside ROI
+                        # Only process people inside the ROI
                         if not (
-                            roi_x1 <= center_x <= roi_x2 and
-                            roi_y1 <= center_y <= roi_y2
+                            roi_x1 <= center_x <= roi_x2
+                            and roi_y1 <= center_y <= roi_y2
                         ):
                             continue
 
-                        box_height = max(1, y2 - y1)
                         pose = keypoints[i]
                         points = pose[:, :2]
-                        kp_conf = pose[:, 2] if pose.shape[1] > 2 else [1.0] * len(pose)
+
+                        kp_conf = (
+                            pose[:, 2]
+                            if pose.shape[1] > 2
+                            else [1.0] * len(pose)
+                        )
 
                         state = walker.update(
                             track_id=track_id,
@@ -156,54 +195,59 @@ def main():
                         )
 
                         motion_state = state["state"]
-                        
-                        # Capture only on transition to MOVING
+
+                        # Detect transition into MOVING
                         if (
                             motion_state == "MOVING"
                             and previous_states.get(track_id) != "MOVING"
                         ):
 
-                            h, w = frame.shape[:2]
-
+                            # Crop the person from the original frame
                             crop_x1 = max(0, min(w, int(x1)))
                             crop_x2 = max(0, min(w, int(x2)))
                             crop_y1 = max(0, min(h, int(y1)))
                             crop_y2 = max(0, min(h, int(y2)))
 
-                            if crop_x2 > crop_x1 and crop_y2 > crop_y1:
+                            if (
+                                crop_x2 > crop_x1
+                                and crop_y2 > crop_y1
+                            ):
 
-                                # Capture snapshot
                                 snapshot = frame[
-                                    crop_y1:crop_y2, crop_x1:crop_x2
+                                    crop_y1:crop_y2,
+                                    crop_x1:crop_x2
                                 ].copy()
 
-                                # Display snapshot
-                                window_name = f"Movement Detected - ID {track_id}"
+                                # Send snapshot to Tkinter
+                                messages.put(("snapshot", snapshot))
 
-                                cv2.imshow(window_name, snapshot)
+                            messages.put(
+                                f"Person {track_id} detected! "
+                                "Waiting for Continue."
+                            )
 
-                                print(f"Person {track_id} detected! Press C to continue.")
+                            # Stop motor
+                            motor.send_command(MST, 0, 0)
+                            motor_stopped = True
 
-                                motor.send_command(3, 0,0) 
-                                motor_stopped = True
+                            # Pause until Continue or Stop is clicked
+                            continue_event.clear()
 
-                                # PAUSE PROGRAM UNTIL C IS PRESSED
-                                while True:
+                            while (
+                                not continue_event.is_set()
+                                and not stop_event.is_set()
+                            ):
+                                time.sleep(0.05)
 
-                                    key = cv2.waitKey(0) & 0xFF
+                            if stop_event.is_set():
+                                break
 
-                                    if key in (ord('c'), ord('C')):
-                                        break
+                            continue_event.clear()
+                            messages.put("Game resumed.")
 
-                                    # Optional: Q exits the program
-                                    if key in (ord('q'), ord('Q')):
-                                        return
-
-                                # Close snapshot window after continuing
-                                cv2.destroyWindow(window_name)                  
-                            
                         previous_states[track_id] = motion_state
 
+                        # Draw bounding box
                         if motion_state == "MOVING":
                             color = (0, 0, 255)
                         elif motion_state == "STATIONARY":
@@ -213,17 +257,39 @@ def main():
 
                         label = f"ID {track_id}: {motion_state}"
 
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(frame, label, (x1, max(25, y1 - 10)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        cv2.rectangle(
+                            frame,
+                            (x1, y1),
+                            (x2, y2),
+                            color,
+                            2
+                        )
+
+                        cv2.putText(
+                            frame,
+                            label,
+                            (x1, max(25, y1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            color,
+                            2
+                        )
 
                         if cfg["display"]["show_skeleton"]:
-                            draw_pose(frame, points, kp_conf,
-                                      cfg["detection"]["keypoint_confidence"])
+                            draw_pose(
+                                frame,
+                                points,
+                                kp_conf,
+                                cfg["detection"]["keypoint_confidence"]
+                            )
 
+                    if stop_event.is_set():
+                        break
+
+            # Clean up old tracking information
             walker.cleanup(now)
 
-            # Draw active detection region
+            # Draw ROI
             cv2.rectangle(
                 frame,
                 (roi_x1, roi_y1),
@@ -242,16 +308,42 @@ def main():
                 (255, 255, 255),
                 2
             )
-            cv2.putText(frame, f"People tracked: {len(result.boxes) if result.boxes is not None else 0}/"
-                               f"{cfg['camera']['max_people']}",
-                        (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.imshow("Cyclops - Person Walking Detection", frame)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            # Display number of tracked people
+            people_count = (
+                len(result.boxes)
+                if result.boxes is not None
+                else 0
+            )
+
+            cv2.putText(
+                frame,
+                f"People tracked: {people_count}/"
+                f"{cfg['camera']['max_people']}",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2
+            )
+
+            # Send live feed to Tkinter
+            send_frame(frame)
+
+    except Exception as e:
+        messages.put(f"ERROR: {e}")
+        raise
+
     finally:
+        # Stop motor
+        try:
+            motor.send_command(MST, 0, 0)
+        except Exception:
+            pass
+
         cap.release()
-        cv2.destroyAllWindows()
+        messages.put("Game stopped.")
+
 
 if __name__ == "__main__":
     main()

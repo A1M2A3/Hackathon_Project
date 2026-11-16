@@ -33,20 +33,42 @@ mov_acc_deg_per_sec = 5000
 microsteps_per_deg = 256*(200/360)
 
 class Motor:
-    def __init__(self,COM_PORT,motor_number,steps_per_degree):
+    def __init__(self, COM_PORT, motor_number, steps_per_degree):
+
         self.COM_PORT = COM_PORT
-        self.home_defined = False
-        self.motor = UsbTmclInterface(COM_PORT)
         self.motor_number = motor_number
         self.steps_per_degree = steps_per_degree
-        self.send_command(SAP,Ref_Search_Mode,1)
-        self.send_command(SAP,Ref_search_spd,self.angle_to_steps(search_speed_deg_per_sec))
-        self.send_command(SAP,Ref_switch_spd,self.angle_to_steps(search_speed_deg_per_sec))
-        self.send_command(RFS, 0,0)                             # homing command
-        self.send_command(SAP,target_spd,self.angle_to_steps(move_spd_deg_per_sec))
-        self.send_command(SAP,max_acc,self.angle_to_steps(mov_acc_deg_per_sec))
+
+        self.home_defined = False
+
+        self.motor = UsbTmclInterface(COM_PORT)
+
+        # Configure homing
+        self.send_command(SAP, Ref_Search_Mode, 1)
+
+        self.send_command(
+            SAP, Ref_search_spd,
+            self.angle_to_steps(search_speed_deg_per_sec)
+        )
+
+        self.send_command(
+            SAP, Ref_switch_spd,
+            self.angle_to_steps(search_speed_deg_per_sec)
+        )
+
+        # Configure normal movement
+        self.send_command(
+            SAP, target_spd,
+            self.angle_to_steps(move_spd_deg_per_sec)
+        )
+
+        self.send_command(
+            SAP, max_acc,
+            self.angle_to_steps(mov_acc_deg_per_sec)
+        )
 
     def send_command(self, opcode, op_type=0, value=0):
+
         response = self.motor.send(
             opcode=opcode,
             op_type=op_type,
@@ -55,19 +77,43 @@ class Motor:
         )
 
         if not response.is_valid:
-            raise ValueError
-        else:
-            return response
+            raise RuntimeError("Invalid TMCL response")
 
-    def steps_to_angle(self, steps):
-        return int(steps/self.steps_per_degree)
+        return response
+
+    def home(self):
+
+        print("Starting motor homing...")
+
+        self.send_command(RFS, 0, 0)
+
+        # IMPORTANT:
+        # Wait for reference search completion here.
+        # Use the reference-search status procedure
+        # specified for your PD42 firmware.
+        while True:
+            response = self.send_command(GAP,pos_reach_flg,0)
+            if response.value == 1:
+                break
+
+        self.home_defined = True
+
+        print("Motor homing complete")
 
     def angle_to_steps(self, angle):
         return int(angle * self.steps_per_degree)
 
+    def steps_to_angle(self, steps):
+        return steps / self.steps_per_degree
+
     def get_position(self):
+
         response = self.send_command(GAP, act_pos, 0)
+
         return response.value / self.steps_per_degree
+
+    def stop(self):
+        self.send_command(MST, 0, 0)
 
 def main():
     motor = Motor(COM_PORT,0,microsteps_per_deg)
