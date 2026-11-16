@@ -2,7 +2,7 @@ model:
   weights: yolo26n-pose.pt
 
 camera:
-  source: 0
+  source: 1
   width: 1280
   height: 720
   fps_target: 30
