@@ -6,6 +6,7 @@ from functools import lru_cache
 
 import cv2
 import time
+import random
 import threading
 import queue
 import os
@@ -267,27 +268,197 @@ def draw_greek_key(canvas, event=None):
                            fill=ORANGE, width=lw)
 
 
-def draw_eye(canvas, w, h):
-    """The big almond eye with a red iris."""
+# How far the iris can slide sideways, as a fraction of the eye's half-width
+EYE_LOOK_RANGE = 0.42
+
+# Motor travel that maps to the eye looking fully one way or the other
+# (matches ANGLE_MIN / ANGLE_MAX in main_snapshot.get_detection_roi)
+EYE_ANGLE_MIN = 0
+EYE_ANGLE_MAX = 90
+
+
+def eye_lid_curve(w, h, openness, sign, steps=32):
+    """Points along an eyelid edge. sign -1 = upper lid, +1 = lower lid.
+
+    At openness 1 the two lids trace the almond outline; at 0 they meet in
+    a flat line through the middle.
+    """
     cx, cy = w / 2, h / 2
-    m = 8
-    canvas.create_polygon(
-        m, cy, m, cy,
-        cx, m,
-        w - m, cy, w - m, cy,
-        cx, h - m,
-        smooth=True, fill=CREAM, outline=ORANGE, width=5
-    )
+    m = h * 0.055
+    half = cx - m
+    reach = (cy - m) * openness
+    pts = []
+    for i in range(steps + 1):
+        x = m + 2 * half * i / steps
+        t = (x - cx) / half
+        pts.append((x, cy + sign * reach * (1 - t * t)))
+    return pts
+
+
+def eye_iris_x(w, h, look):
+    """Iris centre x for look in [-1 (left), 1 (right)]."""
+    half = w / 2 - h * 0.055
+    return w / 2 + max(-1.0, min(1.0, look)) * half * EYE_LOOK_RANGE
+
+
+def draw_eye(canvas, w, h, look=0.0, openness=1.0):
+    """The big almond eye with a red iris, on a Tk canvas."""
+    canvas.delete("all")
+    cy = h / 2
+    upper = eye_lid_curve(w, h, 1.0, -1)
+    lower = eye_lid_curve(w, h, 1.0, 1)
+    canvas.create_polygon(*[c for p in upper + lower[::-1] for c in p],
+                          fill=CREAM, outline="")
+
+    ix = eye_iris_x(w, h, look)
     r = h * 0.30
-    canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+    canvas.create_oval(ix - r, cy - r, ix + r, cy + r,
                        fill=RED, outline=RED_DARK, width=3)
     p = r * 0.45
-    canvas.create_oval(cx - p, cy - p, cx + p, cy + p,
+    canvas.create_oval(ix - p, cy - p, ix + p, cy + p,
                        fill="#0A0A0A", outline="")
     g = r * 0.14
-    gx, gy = cx - p * 0.6, cy - p * 0.6
+    gx, gy = ix - p * 0.6, cy - p * 0.6
     canvas.create_oval(gx - g, gy - g, gx + g, gy + g,
                        fill=CREAM, outline="")
+
+    # The lids also mask off any iris that pokes outside the almond
+    for sign in (-1, 1):
+        edge = 0 if sign < 0 else h
+        curve = [c for p in eye_lid_curve(w, h, openness, sign) for c in p]
+        canvas.create_polygon(0, edge, 0, cy, *curve, w, cy, w, edge,
+                              fill=BG, outline="")
+        canvas.create_line(*curve, fill=ORANGE, width=max(2, h / 30),
+                           capstyle="round")
+
+
+class EyeAnimator:
+    """Main-menu eye: glances side to side and blinks every few seconds."""
+
+    TICK_MS = 30
+    BLINK_SECONDS = 0.24
+
+    def __init__(self, canvas, w, h):
+        self.canvas, self.w, self.h = canvas, w, h
+        now = time.monotonic()
+        self.look = 0.0
+        self.target = 0.0
+        self.openness = 1.0
+        self.next_glance = now + random.uniform(0.8, 2.0)
+        self.next_blink = now + random.uniform(1.2, 2.5)
+        self.blink_start = None
+        self.drawn = None
+        self.tick()
+
+    def tick(self):
+        if not self.canvas.winfo_exists():
+            return
+        now = time.monotonic()
+
+        # Pick somewhere new to look every so often
+        if now >= self.next_glance:
+            choices = [c for c in (-1.0, -0.6, 0.0, 0.6, 1.0)
+                       if c != self.target]
+            self.target = random.choice(choices)
+            self.next_glance = now + random.uniform(1.2, 3.5)
+
+        # Ease towards the target
+        self.look += (self.target - self.look) * 0.18
+        if abs(self.target - self.look) < 0.005:
+            self.look = self.target
+
+        # Blink: open -> shut (held briefly) -> open
+        if self.blink_start is None and now >= self.next_blink:
+            self.blink_start = now
+        if self.blink_start is not None:
+            t = (now - self.blink_start) / self.BLINK_SECONDS
+            if t >= 1:
+                self.openness = 1.0
+                self.blink_start = None
+                self.next_blink = now + random.uniform(2.5, 5.5)
+            else:
+                self.openness = max(0.0, min(1.0, abs(t - 0.5) * 2.4 - 0.2))
+
+        state = (round(self.look, 3), round(self.openness, 3))
+        if state != self.drawn and self.canvas.winfo_ismapped():
+            draw_eye(self.canvas, self.w, self.h, self.look, self.openness)
+            self.drawn = state
+
+        self.canvas.after(self.TICK_MS, self.tick)
+
+
+@lru_cache(maxsize=256)
+def render_eye_image(w, h, look, closed=False):
+    """The same eye as an RGBA PIL image (for drawing onto the camera feed).
+
+    Rendered at 3x and scaled down for smooth edges. `look` should be
+    rounded by the caller so the cache stays useful. `closed` draws the
+    shut eye: a sagging lid line with lashes.
+    """
+    s = 3
+    W, H = w * s, h * s
+    cy = H / 2
+
+    if closed:
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        lw = max(2, int(H / 30))
+        lid = eye_lid_curve(W, H, 0.3, 1)
+        d.line(lid, fill=ORANGE, width=lw, joint="curve")
+        for x, y in (lid[0], lid[-1]):
+            d.ellipse((x - lw / 2, y - lw / 2, x + lw / 2, y + lw / 2),
+                      fill=ORANGE)
+        # Lashes hanging off the lid, splayed outwards from the centre
+        lash = H * 0.16
+        for i in (6, 11, 16, 21, 26):
+            x, y = lid[i]
+            tilt = (x - W / 2) / (W / 2)
+            d.line((x, y, x + tilt * lash * 0.6, y + lash),
+                   fill=ORANGE, width=max(1, int(lw * 0.8)))
+        return img.resize((w, h), Image.Resampling.LANCZOS)
+
+    upper = eye_lid_curve(W, H, 1.0, -1)
+    lower = eye_lid_curve(W, H, 1.0, 1)
+
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).polygon(upper + lower[::-1], fill=255)
+
+    layer = Image.new("RGBA", (W, H), CREAM)
+    d = ImageDraw.Draw(layer)
+    ix = eye_iris_x(W, H, look)
+    r = H * 0.30
+    d.ellipse((ix - r, cy - r, ix + r, cy + r), fill=RED,
+              outline=RED_DARK, width=max(1, int(H / 50)))
+    p = r * 0.45
+    d.ellipse((ix - p, cy - p, ix + p, cy + p), fill="#0A0A0A")
+    g = r * 0.14
+    gx, gy = ix - p * 0.6, cy - p * 0.6
+    d.ellipse((gx - g, gy - g, gx + g, gy + g), fill=CREAM)
+
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    img.paste(layer, (0, 0), mask)
+
+    d = ImageDraw.Draw(img)
+    lw = max(2, int(H / 30))
+    for curve in (upper, lower):
+        d.line(curve, fill=ORANGE, width=lw, joint="curve")
+    for x, y in (upper[0], upper[-1]):  # round the corners
+        d.ellipse((x - lw / 2, y - lw / 2, x + lw / 2, y + lw / 2),
+                  fill=ORANGE)
+
+    return img.resize((w, h), Image.Resampling.LANCZOS)
+
+
+def motor_angle_to_look(angle):
+    """Map the motor angle to an on-screen eye direction in [-1, 1].
+
+    The eye looks towards where the detection zone sits on screen, so the
+    direction flips when the camera view is mirrored.
+    """
+    span = EYE_ANGLE_MAX - EYE_ANGLE_MIN
+    fraction = max(0.0, min(1.0, (angle - EYE_ANGLE_MIN) / span))
+    look = fraction * 2 - 1
+    return -look if MIRROR_CAMERA else look
 
 
 class HexButton(tk.Canvas):
@@ -488,7 +659,7 @@ class CyclopsInterface:
         eye = tk.Canvas(content, width=380, height=150, bg=BG,
                         highlightthickness=0)
         eye.pack()
-        draw_eye(eye, 380, 150)
+        self.menu_eye = EyeAnimator(eye, 380, 150)
 
         tk.Label(
             content, text="NOBODY'S WATCHING", bg=BG, fg=CREAM,
@@ -1122,7 +1293,9 @@ class CyclopsInterface:
 
         # Dark fade behind the title so it reads over the camera
         # (drawn first so outlines and labels stay bright on top of it)
-        shade_h = max(1, int(h * 0.32))
+        # (taller in the lobby, where the shut eye sits above the title)
+        lobby = show_title and not snapshot
+        shade_h = max(1, int(h * (0.40 if lobby else 0.32)))
         if not show_title:
             pass
         elif title_at_bottom:
@@ -1202,6 +1375,22 @@ class CyclopsInterface:
                 draw_centered_text(draw, cx, pill[1] + (ph - (bottom - top)) / 2,
                                    text, pill_font, text_color)
 
+        # Eye at the top centre: in the game it looks where the motor
+        # points; in the lobby it is shut (nobody's watching yet) and the
+        # title is pushed down below it.
+        title_offset = 0
+        if overlay and not snapshot:
+            ew = max(90, int(w * 0.14))
+            eh = int(ew * 150 / 380)
+            ey = int(h * 0.03)
+            if playing:
+                look = round(motor_angle_to_look(overlay["motor"]), 2)
+                eye_img = render_eye_image(ew, eh, look)
+            else:
+                eye_img = render_eye_image(ew, eh, 0.0, closed=True)
+                title_offset = ey + eh - int(h * 0.04)
+            image.paste(eye_img, ((w - ew) // 2, ey), eye_img)
+
         if snapshot:
             title = "CAUGHT MOVING"
             subtitle = (f"Press 1-{self.num_players} to eliminate the player, "
@@ -1212,7 +1401,7 @@ class CyclopsInterface:
 
         if show_title:
             self.draw_overlay_title(draw, w, h, title, subtitle,
-                                    title_at_bottom)
+                                    title_at_bottom, title_offset)
 
         # Small grey stats in the top-right corner
         if overlay and not snapshot:
@@ -1223,7 +1412,8 @@ class CyclopsInterface:
             draw.text((w - 24 - (right - left), 20 - top), stats,
                       font=small, fill=MUTED)
 
-    def draw_overlay_title(self, draw, w, h, title, subtitle, at_bottom):
+    def draw_overlay_title(self, draw, w, h, title, subtitle, at_bottom,
+                           top_offset=0):
         """Big Cinzel title + subtitle, centred at the top or bottom."""
 
         title_font = load_font(tuple(TITLE_FONT_FILES),
@@ -1240,7 +1430,7 @@ class CyclopsInterface:
             y = (h - int(h * 0.05) - (s_bottom - s_top) - gap
                  - (t_bottom - t_top))
         else:
-            y = int(h * 0.06)
+            y = int(h * 0.06) + top_offset
         y += draw_centered_text(draw, w / 2, y, title, title_font, CREAM)
         draw_centered_text(draw, w / 2, y + gap, subtitle, body_font, CREAM)
 
