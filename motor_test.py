@@ -27,7 +27,7 @@ Ref_search_spd = 194
 Ref_switch_spd = 195
 
 # speed and acceleration values for motor
-search_speed_deg_per_sec = 1                # during homing
+search_speed_deg_per_sec = 5                # during homing
 move_spd_deg_per_sec = 10                   # during gameplay
 mov_acc_deg_per_sec = 5000
 microsteps_per_deg = 256*(200/360)

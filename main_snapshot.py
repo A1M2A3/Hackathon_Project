@@ -19,6 +19,49 @@ SKELETON = [
     (11, 13), (13, 15), (12, 14), (14, 16)
 ]
 
+def mark_eliminated(snapshot, points, confidence, crop_origin, threshold=0.35):
+    """Turn a player snapshot black & white and draw a red X over their face.
+
+    The face is located from the COCO head keypoints (0-4: nose, eyes, ears).
+    If none are confident, falls back to the top of the bounding box.
+    """
+    h, w = snapshot.shape[:2]
+
+    # Black & white, kept as 3 channels so the red X can be drawn in colour
+    gray = cv2.cvtColor(snapshot, cv2.COLOR_BGR2GRAY)
+    out = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    ox, oy = crop_origin
+    head = [
+        (points[k][0] - ox, points[k][1] - oy)
+        for k in range(5)
+        if confidence[k] >= threshold
+    ]
+
+    if head:
+        xs = [p[0] for p in head]
+        ys = [p[1] for p in head]
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        # Head keypoints span roughly ear-to-ear; pad to cover the whole face
+        half = max(max(xs) - min(xs), max(ys) - min(ys), w * 0.15) * 0.8
+    else:
+        # No face keypoints: assume the head is at the top-centre of the box
+        cx = w / 2
+        half = min(w, h) * 0.2
+        cy = half
+
+    x1, y1 = int(cx - half), int(cy - half)
+    x2, y2 = int(cx + half), int(cy + half)
+    thickness = max(3, int(half * 0.2))
+    red = (0, 0, 255)  # BGR
+
+    cv2.line(out, (x1, y1), (x2, y2), red, thickness, cv2.LINE_AA)
+    cv2.line(out, (x1, y2), (x2, y1), red, thickness, cv2.LINE_AA)
+
+    return out
+
+
 def draw_pose(frame, points, confidence, threshold=0.35):
     """Draw COCO-17 keypoints and limb connections."""
     for a, b in SKELETON:
@@ -217,6 +260,14 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
                                     crop_y1:crop_y2,
                                     crop_x1:crop_x2
                                 ].copy()
+
+                                # Mark the player as out: B&W + red X on face
+                                snapshot = mark_eliminated(
+                                    snapshot,
+                                    points,
+                                    kp_conf,
+                                    (crop_x1, crop_y1)
+                                )
 
                                 # Send snapshot to Tkinter
                                 messages.put(("snapshot", snapshot))
