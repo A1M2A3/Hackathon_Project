@@ -87,6 +87,17 @@ from main_snapshot import main
 from motor_test import Motor, COM_PORT, microsteps_per_deg
 
 
+def load_player_count(default=4):
+    """Number of players = max_people from config.yaml (falls back to 4)."""
+    try:
+        import yaml
+        with open(os.path.join(_BASE_DIR, "config.yaml"), "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        return int(cfg["camera"]["max_people"])
+    except Exception:
+        return default
+
+
 class CyclopsInterface:
 
     def __init__(self, root):
@@ -116,68 +127,26 @@ class CyclopsInterface:
         self.latest_frame = None
         self.camera_photo = None
 
-        # =========================================
-        # CAMERA DISPLAY
-        # =========================================
+        # Players
+        self.num_players = load_player_count()
+        self.name_vars = [
+            tk.StringVar(value=f"Player {i}")
+            for i in range(1, self.num_players + 1)
+        ]
+        self.survived = [False] * self.num_players
+        self.eliminated = [False] * self.num_players
 
-        self.camera_label = ttk.Label(root)
+        # True while a snapshot is on screen (game paused on a detection)
+        self.snapshot_showing = False
 
-        self.camera_label.pack(
-            fill="both",
-            expand=True
-        )
+        self.build_main_menu()
+        self.build_game_screen()
+        self.build_results_screen()
 
-        # Resize image whenever window changes size
-        self.camera_label.bind(
-            "<Configure>",
-            self.resize_camera
-        )
+        # Number keys mark players as survived during a game
+        self.root.bind("<Key>", self.on_key_press)
 
-        # =========================================
-        # OVERLAY CONTROL PANEL
-        # =========================================
-
-        self.controls = ttk.Frame(
-            self.camera_label,
-            padding=10
-        )
-
-        self.controls.place(
-            relx=0.5,
-            y=15,
-            anchor="n"
-        )
-
-        self.home_button = ttk.Button(
-            self.controls,
-            text="Motor Home",
-            command=self.home_motor
-        )
-        self.home_button.pack(side="left", padx=5)
-
-        self.start_button = ttk.Button(
-            self.controls,
-            text="Start Game",
-            command=self.start_game,
-            state="disabled"
-        )
-        self.start_button.pack(side="left", padx=5)
-
-        self.stop_button = ttk.Button(
-            self.controls,
-            text="Stop Game",
-            command=self.stop_game,
-            state="disabled"
-        )
-        self.stop_button.pack(side="left", padx=5)
-
-        self.continue_button = ttk.Button(
-            self.controls,
-            text="Continue",
-            command=self.continue_game,
-            state="disabled"
-        )
-        self.continue_button.pack(side="left", padx=5)
+        self.show_main_menu()
 
         # =========================================
         # START UI UPDATE LOOP
@@ -192,6 +161,298 @@ class CyclopsInterface:
             "WM_DELETE_WINDOW",
             self.close_window
         )
+
+    # =========================================
+    # MAIN MENU
+    # =========================================
+
+    def build_main_menu(self):
+
+        self.menu_frame = ttk.Frame(self.root, padding=30)
+
+        ttk.Label(
+            self.menu_frame,
+            text="Cyclops",
+            font=("Segoe UI", 32, "bold")
+        ).pack(pady=(40, 20))
+
+        # Player name entries
+        players_box = ttk.LabelFrame(
+            self.menu_frame,
+            text="Players",
+            padding=10
+        )
+        players_box.pack(pady=10)
+
+        for i, var in enumerate(self.name_vars, start=1):
+            ttk.Label(
+                players_box,
+                text=f"{i}.",
+                font=("Segoe UI", 12)
+            ).grid(row=i, column=0, padx=(0, 8), pady=3, sticky="e")
+
+            ttk.Entry(
+                players_box,
+                textvariable=var,
+                width=25
+            ).grid(row=i, column=1, pady=3)
+
+        # Menu buttons
+        buttons = ttk.Frame(self.menu_frame)
+        buttons.pack(pady=20)
+
+        self.home_button = ttk.Button(
+            buttons,
+            text="Home Motor",
+            command=self.home_motor
+        )
+        self.home_button.pack(fill="x", pady=5, ipadx=20, ipady=5)
+
+        self.start_button = ttk.Button(
+            buttons,
+            text="Start Game",
+            command=self.start_game,
+            state="disabled"
+        )
+        self.start_button.pack(fill="x", pady=5, ipadx=20, ipady=5)
+
+        self.quit_button = ttk.Button(
+            buttons,
+            text="Quit Game",
+            command=self.close_window
+        )
+        self.quit_button.pack(fill="x", pady=5, ipadx=20, ipady=5)
+
+        self.status_var = tk.StringVar(value="Home the motor to begin.")
+
+        ttk.Label(
+            self.menu_frame,
+            textvariable=self.status_var,
+            foreground="gray"
+        ).pack(pady=10)
+
+    # =========================================
+    # GAME SCREEN
+    # =========================================
+
+    def build_game_screen(self):
+
+        self.game_frame = ttk.Frame(self.root)
+
+        # -------------------------------------
+        # Player list (right side)
+        # -------------------------------------
+
+        panel = ttk.Frame(self.game_frame, padding=15)
+        panel.pack(side="right", fill="y")
+
+        ttk.Label(
+            panel,
+            text="Players",
+            font=("Segoe UI", 16, "bold")
+        ).pack(anchor="w", pady=(0, 10))
+
+        self.player_rows = [
+            self.make_player_row(panel, font_size=14)
+            for _ in range(self.num_players)
+        ]
+
+        ttk.Label(
+            panel,
+            text=(
+                f"Press 1-{self.num_players} to mark a player as survived.\n\n"
+                f"While a snapshot is shown, press 1-{self.num_players} "
+                "to eliminate that player."
+            ),
+            wraplength=180,
+            foreground="gray"
+        ).pack(side="bottom", anchor="w")
+
+        # -------------------------------------
+        # Camera display
+        # -------------------------------------
+
+        self.camera_label = ttk.Label(self.game_frame, anchor="center")
+
+        self.camera_label.pack(
+            side="left",
+            fill="both",
+            expand=True
+        )
+
+        # Resize image whenever window changes size
+        self.camera_label.bind(
+            "<Configure>",
+            self.resize_camera
+        )
+
+        # -------------------------------------
+        # Overlay controls
+        # -------------------------------------
+
+        self.controls = ttk.Frame(
+            self.camera_label,
+            padding=10
+        )
+
+        self.controls.place(
+            relx=0.5,
+            y=15,
+            anchor="n"
+        )
+
+        self.continue_button = ttk.Button(
+            self.controls,
+            text="Continue Game",
+            command=self.continue_game,
+            state="disabled"
+        )
+        self.continue_button.pack(side="left", padx=5)
+
+        self.end_button = ttk.Button(
+            self.controls,
+            text="End Game",
+            command=self.end_game
+        )
+        self.end_button.pack(side="left", padx=5)
+
+    # =========================================
+    # RESULTS SCREEN
+    # =========================================
+
+    def build_results_screen(self):
+
+        self.results_frame = ttk.Frame(self.root, padding=30)
+
+        ttk.Label(
+            self.results_frame,
+            text="Game Over",
+            font=("Segoe UI", 32, "bold")
+        ).pack(pady=(40, 20))
+
+        box = ttk.LabelFrame(
+            self.results_frame,
+            text="Results",
+            padding=15
+        )
+        box.pack(pady=10)
+
+        self.result_rows = [
+            self.make_player_row(box, font_size=18)
+            for _ in range(self.num_players)
+        ]
+
+        ttk.Button(
+            self.results_frame,
+            text="Return to Main Menu",
+            command=self.show_main_menu
+        ).pack(pady=30, ipadx=20, ipady=5)
+
+    # =========================================
+    # SCREEN SWITCHING
+    # =========================================
+
+    def show_main_menu(self):
+
+        self.game_frame.pack_forget()
+        self.results_frame.pack_forget()
+        self.menu_frame.pack(fill="both", expand=True)
+
+    def show_game_screen(self):
+
+        self.menu_frame.pack_forget()
+        self.results_frame.pack_forget()
+        self.refresh_player_list()
+        self.game_frame.pack(fill="both", expand=True)
+
+    def show_results_screen(self):
+
+        self.game_frame.pack_forget()
+        self.menu_frame.pack_forget()
+        self.refresh_rows(self.result_rows)
+        self.results_frame.pack(fill="both", expand=True)
+
+    # =========================================
+    # PLAYER LIST
+    # =========================================
+
+    def make_player_row(self, parent, font_size):
+        """A row with a player name, a status label and a red strike line."""
+
+        row = ttk.Frame(parent)
+        row.pack(anchor="w", fill="x", pady=4)
+
+        name_label = tk.Label(row, font=("Segoe UI", font_size))
+        name_label.pack(side="left")
+
+        status_label = ttk.Label(
+            row,
+            font=("Segoe UI", font_size, "bold")
+        )
+        status_label.pack(side="left", padx=(10, 0))
+
+        # Single red line drawn through the name when eliminated
+        strike = tk.Frame(row, bg="red", height=2)
+
+        return name_label, status_label, strike
+
+    def player_name(self, index):
+
+        name = self.name_vars[index].get().strip()
+        return name or f"Player {index + 1}"
+
+    def refresh_rows(self, rows):
+
+        for i, (name_label, status_label, strike) in enumerate(rows):
+            name_label.config(text=f"{i + 1}. {self.player_name(i)}")
+
+            if self.eliminated[i]:
+                status_label.config(text="Eliminated", foreground="red")
+                strike.place(
+                    in_=name_label,
+                    relx=0, rely=0.5, relwidth=1,
+                    height=2, anchor="w"
+                )
+                strike.lift()
+            elif self.survived[i]:
+                status_label.config(text="Survived", foreground="green")
+                strike.place_forget()
+            else:
+                status_label.config(text="")
+                strike.place_forget()
+
+    def refresh_player_list(self):
+
+        self.refresh_rows(self.player_rows)
+
+    def on_key_press(self, event):
+
+        # Only react on the game screen (so typing names isn't affected)
+        if not self.game_frame.winfo_ismapped():
+            return
+
+        if not event.char or not event.char.isdigit():
+            return
+
+        index = int(event.char) - 1
+
+        if not 0 <= index < self.num_players:
+            return
+
+        # Pressing again un-marks, in case of a mistake
+        if self.snapshot_showing:
+            self.eliminated[index] = not self.eliminated[index]
+            if self.eliminated[index]:
+                self.survived[index] = False
+        else:
+            self.survived[index] = not self.survived[index]
+            if self.survived[index]:
+                self.eliminated[index] = False
+
+        self.refresh_player_list()
+
+        if all(s or e for s, e in zip(self.survived, self.eliminated)):
+            self.finish_game()
 
     # =========================================
     # CAMERA RESIZING
@@ -242,6 +503,7 @@ class CyclopsInterface:
 
         self.home_button.config(state="disabled")
         self.start_button.config(state="disabled")
+        self.status_var.set("Homing motor...")
 
         self.motor_thread = threading.Thread(
             target=self.home_motor_worker,
@@ -280,11 +542,25 @@ class CyclopsInterface:
 
     def start_game(self):
 
-        if not self.motor_homed:
+        if not self.motor_homed or self.game_running:
             return
 
         self.stop_event.clear()
         self.continue_event.set()
+
+        # Fresh game: nobody has survived yet, no old frames
+        self.survived = [False] * self.num_players
+        self.eliminated = [False] * self.num_players
+        self.snapshot_showing = False
+        self.latest_frame = None
+        self.camera_photo = None
+        self.camera_label.configure(image="")
+
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
 
         self.game_thread = threading.Thread(
             target=main,
@@ -302,14 +578,13 @@ class CyclopsInterface:
 
         self.game_running = True
 
-        self.start_button.config(state="disabled")
-        self.stop_button.config(state="normal")
-        self.home_button.config(state="disabled")
+        self.continue_button.config(state="disabled")
+        self.show_game_screen()
 
         self.messages.put("Starting game...")
 
     # =========================================
-    # STOP GAME
+    # END GAME
     # =========================================
 
     def stop_game(self):
@@ -319,9 +594,26 @@ class CyclopsInterface:
         # Release game if it is paused
         self.continue_event.set()
 
-        self.stop_button.config(state="disabled")
+        self.snapshot_showing = False
+        self.continue_button.config(state="disabled")
 
-        self.messages.put("Stopping game...")
+        if self.game_running:
+            # Wait for "Game stopped" before allowing a new game
+            self.start_button.config(state="disabled")
+            self.home_button.config(state="disabled")
+            self.status_var.set("Stopping game...")
+            self.messages.put("Stopping game...")
+
+    def end_game(self):
+
+        self.stop_game()
+        self.show_main_menu()
+
+    def finish_game(self):
+        """All players are resolved: stop the game and show the results."""
+
+        self.stop_game()
+        self.show_results_screen()
 
     # =========================================
     # CONTINUE GAME
@@ -329,6 +621,7 @@ class CyclopsInterface:
 
     def continue_game(self):
 
+        self.snapshot_showing = False
         self.continue_event.set()
 
         self.continue_button.config(state="disabled")
@@ -370,6 +663,7 @@ class CyclopsInterface:
                     snapshot = message[1]
 
                     self.latest_frame = snapshot
+                    self.snapshot_showing = True
 
                     # Display snapshot in centre
                     self.display_frame(snapshot)
@@ -398,11 +692,15 @@ class CyclopsInterface:
                     state="disabled"
                 )
 
+                self.status_var.set("Motor homed. Ready to start.")
+
             elif message.startswith("Motor homing failed"):
 
                 self.home_button.config(
                     state="normal"
                 )
+
+                self.status_var.set(message)
 
             elif (
                 message.startswith("Person ")
@@ -413,19 +711,17 @@ class CyclopsInterface:
                     state="normal"
                 )
 
-            elif message == "Game resumed":
+            elif message.startswith("Game resumed"):
+
+                self.snapshot_showing = False
 
                 self.continue_button.config(
                     state="disabled"
                 )
 
-            elif message == "Game stopped":
+            elif message.startswith("Game stopped"):
 
                 self.game_running = False
-
-                self.stop_button.config(
-                    state="disabled"
-                )
 
                 self.continue_button.config(
                     state="disabled"
@@ -439,6 +735,15 @@ class CyclopsInterface:
                     state="normal" if self.motor_homed else "disabled"
                 )
 
+                self.status_var.set(
+                    "Ready to start." if self.motor_homed
+                    else "Home the motor to begin."
+                )
+
+            elif message.startswith("ERROR"):
+
+                self.status_var.set(message)
+
         # -------------------------------------
         # 4. SCHEDULE NEXT UPDATE
         # -------------------------------------
@@ -449,7 +754,7 @@ class CyclopsInterface:
         )
 
     # =========================================
-    # CLOSE WINDOW
+    # CLOSE WINDOW / QUIT
     # =========================================
 
     def close_window(self):
@@ -471,5 +776,3 @@ if __name__ == "__main__":
     app = CyclopsInterface(root)
 
     root.mainloop()
-
-
