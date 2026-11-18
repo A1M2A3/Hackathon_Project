@@ -101,7 +101,15 @@ def get_detection_roi(position_deg, frame_width, frame_height):
     return x1, 0, x2, frame_height
 
 
-def main(motor, stop_event, continue_event, frame_queue, messages):
+def main(motor, stop_event, continue_event, frame_queue, messages,
+         ready_event=None):
+    """Run the camera / detection loop.
+
+    Until ready_event is set the game is in the "Step into the frame"
+    lobby: the camera feed and player outlines are shown, but the motor
+    stays still and nobody can be caught. Setting ready_event (the
+    "All Players Ready" button) starts the real game.
+    """
     # TMCL command opcodes
     MST = 3
     MVP = 4
@@ -134,10 +142,15 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
     # position-reached flag at 0 and would otherwise stall the motor.
     motor_stopped = True
 
-    def send_frame(frame):
-        """Keep only the newest live camera frame in the queue."""
+    def send_frame(frame, overlay):
+        """Keep only the newest live camera frame in the queue.
+
+        The frame is sent clean; the interface draws the styled overlay
+        (player outlines, labels, ROI, stats) from the overlay dict.
+        """
+        item = (frame.copy(), overlay)
         try:
-            frame_queue.put_nowait(frame.copy())
+            frame_queue.put_nowait(item)
         except queue.Full:
             try:
                 frame_queue.get_nowait()
@@ -145,17 +158,30 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
                 pass
 
             try:
-                frame_queue.put_nowait(frame.copy())
+                frame_queue.put_nowait(item)
             except queue.Full:
                 pass
+
+    playing = ready_event is None or ready_event.is_set()
 
     try:
         while not stop_event.is_set():
 
-            # Check whether the motor has reached its target
-            response = motor.send_command(6, 8, 0)
+            # Lobby -> game: start with fresh motion history so nobody is
+            # caught for moving while they were still lining up.
+            if not playing and ready_event.is_set():
+                playing = True
+                walker = WalkingDetector(cfg["walking"])
+                previous_states = {}
+                messages.put("Game started.")
 
-            if response.is_valid:
+            # Check whether the motor has reached its target
+            # (the motor stays still in the lobby)
+            response = (
+                motor.send_command(6, 8, 0) if playing else None
+            )
+
+            if response is not None and response.is_valid:
                 if response.value == 1 or motor_stopped:
 
                     motor_stopped = False
@@ -199,6 +225,9 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
 
             result = results[0]
 
+            # People drawn by the interface: (track_id, (x1, y1, x2, y2), state)
+            people = []
+
             if result.boxes is not None and result.keypoints is not None:
 
                 boxes = result.boxes
@@ -217,7 +246,8 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
                         center_y = (y1 + y2) // 2
 
                         # Only process people inside the ROI
-                        if not (
+                        # (in the lobby everyone is shown)
+                        if playing and not (
                             roi_x1 <= center_x <= roi_x2
                             and roi_y1 <= center_y <= roi_y2
                         ):
@@ -244,7 +274,8 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
 
                         # Detect transition into MOVING
                         if (
-                            motion_state == "MOVING"
+                            playing
+                            and motion_state == "MOVING"
                             and previous_states.get(track_id) != "MOVING"
                         ):
 
@@ -301,32 +332,9 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
 
                         previous_states[track_id] = motion_state
 
-                        # Draw bounding box
-                        if motion_state == "MOVING":
-                            color = (0, 0, 255)
-                        elif motion_state == "STATIONARY":
-                            color = (0, 200, 0)
-                        else:
-                            color = (0, 255, 255)
-
-                        label = f"ID {track_id}: {motion_state}"
-
-                        cv2.rectangle(
-                            frame,
-                            (x1, y1),
-                            (x2, y2),
-                            color,
-                            2
-                        )
-
-                        cv2.putText(
-                            frame,
-                            label,
-                            (x1, max(25, y1 - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            color,
-                            2
+                        # Outline + label are drawn by the interface
+                        people.append(
+                            (track_id, (x1, y1, x2, y2), motion_state)
                         )
 
                         if cfg["display"]["show_skeleton"]:
@@ -343,46 +351,22 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
             # Clean up old tracking information
             walker.cleanup(now)
 
-            # Draw ROI
-            cv2.rectangle(
-                frame,
-                (roi_x1, roi_y1),
-                (roi_x2, roi_y2),
-                (255, 0, 0),
-                2
-            )
-
-            # Display motor position
-            cv2.putText(
-                frame,
-                f"Motor: {motor_position:.1f} degrees",
-                (15, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
-            )
-
-            # Display number of tracked people
+            # Number of tracked people
             people_count = (
                 len(result.boxes)
                 if result.boxes is not None
                 else 0
             )
 
-            cv2.putText(
-                frame,
-                f"People tracked: {people_count}/"
-                f"{cfg['camera']['max_people']}",
-                (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2
-            )
-
-            # Send live feed to Tkinter
-            send_frame(frame)
+            # Send live feed + overlay data to Tkinter
+            send_frame(frame, {
+                "playing": playing,
+                "people": people,
+                "roi": (roi_x1, roi_y1, roi_x2, roi_y2) if playing else None,
+                "motor": motor_position,
+                "count": people_count,
+                "max_people": cfg["camera"]["max_people"],
+            })
 
     except Exception as e:
         messages.put(f"ERROR: {e}")

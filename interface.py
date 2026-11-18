@@ -1,9 +1,11 @@
 
 import tkinter as tk
 from tkinter import ttk
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
+from functools import lru_cache
 
 import cv2
+import time
 import threading
 import queue
 import os
@@ -98,13 +100,282 @@ def load_player_count(default=4):
         return default
 
 
+# =========================================
+# THEME (from the Figma main screen)
+# =========================================
+
+BG = "#0E0906"            # near-black brown background
+PANEL = "#170F0A"         # button / entry fill
+PANEL_HOVER = "#2A1A0E"
+ORANGE = "#E8892B"        # accent: borders, small caps text
+CREAM = "#F3E6CC"         # title / body text, eye white
+RED = "#D8322A"           # iris
+RED_DARK = "#7A1A14"
+DISABLED = "#5A4A3A"
+SURVIVED = "#9BC46A"      # muted green that reads on the dark background
+MUTED = "#8A7F72"         # small grey captions on the camera screen
+INK = "#1A120C"           # dark text on filled pills
+
+# Outline / pill colour per player slot (P1, P2, ...)
+PLAYER_COLORS = [ORANGE, "#4FC4B8", "#C38BE0", "#E8C547"]
+
+# Cinzel font family bundled with the project (Cinzel/static/*.ttf)
+CINZEL_DIR = os.path.join(_BASE_DIR, "Cinzel", "static")
+
+
+def register_bundled_fonts():
+    """Make the bundled Cinzel fonts usable by Tkinter (this process only).
+
+    Uses the Windows FR_PRIVATE flag, so nothing is installed system-wide.
+    Must run before the Tk root window is created.
+    """
+    if not os.path.isdir(CINZEL_DIR):
+        return
+    try:
+        import ctypes
+        FR_PRIVATE = 0x10
+        for name in os.listdir(CINZEL_DIR):
+            if name.lower().endswith(".ttf"):
+                ctypes.windll.gdi32.AddFontResourceExW(
+                    os.path.join(CINZEL_DIR, name), FR_PRIVATE, 0
+                )
+    except (AttributeError, OSError) as e:
+        print(f"Could not load Cinzel fonts: {e}")
+
+
+register_bundled_fonts()
+
+# TrueType files for drawing on the camera image (first one found wins)
+TITLE_FONT_FILES = [os.path.join(CINZEL_DIR, "Cinzel-Bold.ttf"),
+                    "Cinzel-Bold.ttf", "georgiab.ttf", "DejaVuSerif-Bold.ttf"]
+BODY_FONT_FILES = ["Inter-Regular.ttf", "segoeui.ttf", "DejaVuSans.ttf"]
+BOLD_FONT_FILES = ["Inter-Bold.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf"]
+
+
+# Show the camera (and snapshots) mirrored, like a selfie view, so a player
+# moving to their left moves left on screen.
+MIRROR_CAMERA = True
+
+
+def mirror_overlay(overlay, frame_w):
+    """Flip the x coordinates of the detection overlay to match a mirror."""
+    if not overlay:
+        return overlay
+
+    def flip(box):
+        x1, y1, x2, y2 = box
+        return (frame_w - x2, y1, frame_w - x1, y2)
+
+    mirrored = dict(overlay)
+    mirrored["people"] = [
+        (track_id, flip(box), state)
+        for track_id, box, state in overlay.get("people", [])
+    ]
+    if overlay.get("roi"):
+        mirrored["roi"] = flip(overlay["roi"])
+    return mirrored
+
+
+@lru_cache(maxsize=64)
+def load_font(files, size):
+    """PIL font from the first TrueType file that loads."""
+    for name in files:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+@lru_cache(maxsize=8)
+def top_shade_mask(width, height):
+    """Alpha mask that darkens the top of the camera image (for the title)."""
+    mask = Image.new("L", (1, height))
+    for y in range(height):
+        mask.putpixel((0, y), int(235 * (1 - y / height) ** 1.4))
+    return mask.resize((width, height))
+
+
+def draw_dashed_rounded_rect(draw, box, radius, color, width=4,
+                             dash=18, gap=12):
+    """Dashed rounded rectangle (PIL has no dashed lines)."""
+    x1, y1, x2, y2 = box
+    r = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+
+    def dashed(ax, ay, bx, by):
+        length = max(abs(bx - ax), abs(by - ay))
+        if length <= 0:
+            return
+        pos = 0
+        while pos < length:
+            end = min(pos + dash, length)
+            t0, t1 = pos / length, end / length
+            draw.line(
+                (ax + (bx - ax) * t0, ay + (by - ay) * t0,
+                 ax + (bx - ax) * t1, ay + (by - ay) * t1),
+                fill=color, width=width
+            )
+            pos += dash + gap
+
+    dashed(x1 + r, y1, x2 - r, y1)
+    dashed(x1 + r, y2, x2 - r, y2)
+    dashed(x1, y1 + r, x1, y2 - r)
+    dashed(x2, y1 + r, x2, y2 - r)
+    if r:
+        d = 2 * r
+        draw.arc((x1, y1, x1 + d, y1 + d), 180, 270, fill=color, width=width)
+        draw.arc((x2 - d, y1, x2, y1 + d), 270, 360, fill=color, width=width)
+        draw.arc((x2 - d, y2 - d, x2, y2), 0, 90, fill=color, width=width)
+        draw.arc((x1, y2 - d, x1 + d, y2), 90, 180, fill=color, width=width)
+
+
+def draw_centered_text(draw, cx, y, text, font, fill):
+    """Text horizontally centred on cx with its top at y; returns height."""
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    draw.text((cx - (right - left) / 2 - left, y - top), text,
+              font=font, fill=fill)
+    return bottom - top
+
+
+def pick_font(root, candidates):
+    """First installed font family from candidates (last one is the fallback)."""
+    import tkinter.font as tkfont
+    installed = set(tkfont.families(root))
+    return next((f for f in candidates if f in installed), candidates[-1])
+
+
+def draw_greek_key(canvas, event=None):
+    """Draw a repeating Greek key (meander) border across a canvas."""
+    canvas.delete("all")
+    w = canvas.winfo_width()
+    h = canvas.winfo_height()
+    s = 4                      # grid size of one meander step
+    top, bottom = 4, h - 4
+    lw = 2
+    canvas.create_line(0, top, w, top, fill=ORANGE, width=lw)
+    canvas.create_line(0, bottom, w, bottom, fill=ORANGE, width=lw)
+    y0 = top + s
+    for x in range(0, w + 6 * s, 6 * s):
+        pts = [
+            (0, 5), (0, 0), (4, 0), (4, 3), (2, 3), (2, 2),
+        ]
+        coords = []
+        for px, py in pts:
+            coords += [x + px * s, y0 + py * s]
+        canvas.create_line(*coords, fill=ORANGE, width=lw)
+        canvas.create_line(x, y0 + 5 * s, x + 6 * s, y0 + 5 * s,
+                           fill=ORANGE, width=lw)
+
+
+def draw_eye(canvas, w, h):
+    """The big almond eye with a red iris."""
+    cx, cy = w / 2, h / 2
+    m = 8
+    canvas.create_polygon(
+        m, cy, m, cy,
+        cx, m,
+        w - m, cy, w - m, cy,
+        cx, h - m,
+        smooth=True, fill=CREAM, outline=ORANGE, width=5
+    )
+    r = h * 0.30
+    canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                       fill=RED, outline=RED_DARK, width=3)
+    p = r * 0.45
+    canvas.create_oval(cx - p, cy - p, cx + p, cy + p,
+                       fill="#0A0A0A", outline="")
+    g = r * 0.14
+    gx, gy = cx - p * 0.6, cy - p * 0.6
+    canvas.create_oval(gx - g, gy - g, gx + g, gy + g,
+                       fill=CREAM, outline="")
+
+
+class HexButton(tk.Canvas):
+    """Elongated-hexagon button in the Figma style.
+
+    Supports .config(state="normal"/"disabled") like a regular button.
+    """
+
+    def __init__(self, parent, text, command, width=200, height=42,
+                 font=("Georgia", 14), diamonds=False, state="normal"):
+        self._pad = 34 if diamonds else 2
+        super().__init__(
+            parent,
+            width=width + 2 * self._pad,
+            height=height,
+            bg=BG,
+            highlightthickness=0,
+            cursor="hand2"
+        )
+        self._text = text
+        self._command = command
+        self._btn_w = width
+        self._btn_h = height
+        self._font = font
+        self._diamonds = diamonds
+        self._state = state
+        self._hover = False
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<ButtonRelease-1>", self._on_click)
+        self._draw()
+
+    def configure(self, cnf=None, **kw):
+        if "state" in kw:
+            self._state = kw.pop("state")
+            self._draw()
+            if not kw and cnf is None:
+                return None
+        return super().configure(cnf, **kw)
+
+    config = configure
+
+    def _set_hover(self, value):
+        self._hover = value
+        self._draw()
+
+    def _on_click(self, event):
+        if self._state != "disabled" and self._command:
+            self._command()
+
+    def _draw(self):
+        self.delete("all")
+        enabled = self._state != "disabled"
+        line = ORANGE if enabled else DISABLED
+        text = CREAM if enabled else DISABLED
+        fill = PANEL_HOVER if (self._hover and enabled) else PANEL
+        self.configure(cursor="hand2" if enabled else "arrow")
+
+        x0, x1 = self._pad, self._pad + self._btn_w
+        h = self._btn_h
+        mid = h / 2
+        cut = 14
+        self.create_polygon(
+            x0, mid, x0 + cut, 2, x1 - cut, 2,
+            x1, mid, x1 - cut, h - 2, x0 + cut, h - 2,
+            fill=fill, outline=line, width=2
+        )
+        self.create_text((x0 + x1) / 2, mid, text=self._text,
+                         fill=text, font=self._font)
+
+        if self._diamonds:
+            for dx in (self._pad / 2, x1 + self._pad / 2):
+                d = 8
+                self.create_polygon(dx, mid - d, dx + d, mid, dx, mid + d,
+                                    dx - d, mid, fill=BG, outline=line,
+                                    width=2)
+                d = 3
+                self.create_polygon(dx, mid - d, dx + d, mid, dx, mid + d,
+                                    dx - d, mid, fill=line, outline="")
+
+
 class CyclopsInterface:
 
     def __init__(self, root):
 
         self.root = root
         ensure_boom_sound()
-        self.root.title("Cyclops Control Panel")
+        self.root.title("Nobody's Watching")
         self.root.geometry("1050x800")
         self.root.minsize(600, 400)
 
@@ -116,6 +387,10 @@ class CyclopsInterface:
         self.stop_event = threading.Event()
         self.continue_event = threading.Event()
         self.continue_event.set()
+
+        # Set by "All Players Ready": ends the lobby and starts the game
+        self.ready_event = threading.Event()
+        self.in_lobby = False
 
         self.frame_queue = queue.Queue(maxsize=1)
         self.messages = queue.Queue()
@@ -147,6 +422,17 @@ class CyclopsInterface:
         self.current_snapshot = None
         self.graveyard_photos = []
 
+        # Overlay data that came with the latest live frame
+        self.latest_overlay = None
+        # Track ID -> [player slot, last seen time] for the P1/P2 labels
+        self.track_slots = {}
+
+        # Fonts shared by the themed screens
+        self._results_serif = pick_font(
+            self.root, ["Cinzel", "Trajan Pro", "Cormorant Garamond", "Georgia"]
+        )
+        self._results_sans = pick_font(self.root, ["Inter", "Segoe UI"])
+
         self.build_main_menu()
         self.build_game_screen()
         self.build_results_screen()
@@ -176,70 +462,98 @@ class CyclopsInterface:
 
     def build_main_menu(self):
 
-        self.menu_frame = ttk.Frame(self.root, padding=30)
-
-        ttk.Label(
-            self.menu_frame,
-            text="Cyclops",
-            font=("Segoe UI", 32, "bold")
-        ).pack(pady=(40, 20))
-
-        # Player name entries
-        players_box = ttk.LabelFrame(
-            self.menu_frame,
-            text="Players",
-            padding=10
+        serif = pick_font(
+            self.root, ["Cinzel", "Trajan Pro", "Cormorant Garamond", "Georgia"]
         )
-        players_box.pack(pady=10)
+        sans = pick_font(self.root, ["Inter", "Segoe UI"])
 
-        # Names laid out horizontally: "1. [entry]  2. [entry] ..."
+        self.menu_frame = tk.Frame(self.root, bg=BG)
+
+        # Greek key borders, top and bottom
+        for side in ("top", "bottom"):
+            border = tk.Canvas(self.menu_frame, height=32, bg=BG,
+                               highlightthickness=0)
+            border.pack(side=side, fill="x", padx=8, pady=8)
+            border.bind("<Configure>",
+                        lambda e, c=border: draw_greek_key(c, e))
+
+        content = tk.Frame(self.menu_frame, bg=BG)
+        content.pack(expand=True)
+
+        tk.Label(
+            content, text="NOBODY'S WATCHING", bg=BG, fg=ORANGE,
+            font=(sans, 10, "bold")
+        ).pack(pady=(0, 14))
+
+        eye = tk.Canvas(content, width=380, height=150, bg=BG,
+                        highlightthickness=0)
+        eye.pack()
+        draw_eye(eye, 380, 150)
+
+        tk.Label(
+            content, text="NOBODY'S WATCHING", bg=BG, fg=CREAM,
+            font=(serif, 44, "bold")
+        ).pack(pady=(26, 6))
+
+        tk.Label(
+            content,
+            text="Move when the eye is closed to safely escape the cave.",
+            bg=BG, fg=CREAM, font=(sans, 13)
+        ).pack(pady=(0, 24))
+
+        # Player name entries: "1. [entry]  2. [entry] ..."
+        players_box = tk.Frame(content, bg=BG)
+        players_box.pack(pady=(0, 24))
+
         for i, var in enumerate(self.name_vars, start=1):
-            ttk.Label(
-                players_box,
-                text=f"{i}.",
-                font=("Segoe UI", 12)
-            ).grid(row=0, column=2 * (i - 1), padx=(10 if i > 1 else 0, 4),
-                   pady=3, sticky="e")
+            tk.Label(
+                players_box, text=f"{i}.", bg=BG, fg=ORANGE,
+                font=(sans, 12, "bold")
+            ).grid(row=0, column=2 * (i - 1),
+                   padx=(14 if i > 1 else 0, 4), pady=3, sticky="e")
 
-            ttk.Entry(
-                players_box,
-                textvariable=var,
-                width=15
-            ).grid(row=0, column=2 * (i - 1) + 1, pady=3)
+            tk.Entry(
+                players_box, textvariable=var, width=13,
+                bg=PANEL, fg=CREAM, insertbackground=CREAM,
+                relief="flat", font=(sans, 11),
+                highlightthickness=1, highlightbackground=DISABLED,
+                highlightcolor=ORANGE
+            ).grid(row=0, column=2 * (i - 1) + 1, pady=3, ipady=4)
 
-        # Menu buttons
-        buttons = ttk.Frame(self.menu_frame)
-        buttons.pack(pady=20)
-
-        self.home_button = ttk.Button(
-            buttons,
-            text="Home Motor",
-            command=self.home_motor
+        # Main START button with diamonds either side
+        self.start_button = HexButton(
+            content, "START", self.start_game, width=200, height=44,
+            font=(serif, 15), diamonds=True, state="disabled"
         )
-        self.home_button.pack(fill="x", pady=5, ipadx=20, ipady=5)
+        self.start_button.pack()
 
-        self.start_button = ttk.Button(
-            buttons,
-            text="Start Game",
-            command=self.start_game,
-            state="disabled"
-        )
-        self.start_button.pack(fill="x", pady=5, ipadx=20, ipady=5)
+        # Secondary buttons
+        secondary = tk.Frame(content, bg=BG)
+        secondary.pack(pady=(12, 0))
 
-        self.quit_button = ttk.Button(
-            buttons,
-            text="Quit Game",
-            command=self.close_window
+        self.home_button = HexButton(
+            secondary, "HOME MOTOR", self.home_motor, width=150, height=34,
+            font=(serif, 11)
         )
-        self.quit_button.pack(fill="x", pady=5, ipadx=20, ipady=5)
+        self.home_button.pack(side="left", padx=6)
+
+        self.quit_button = HexButton(
+            secondary, "QUIT", self.close_window, width=150, height=34,
+            font=(serif, 11)
+        )
+        self.quit_button.pack(side="left", padx=6)
+
+        tk.Label(
+            content, text="STAND BACK SO THE CAMERA CAN SEE YOU",
+            bg=BG, fg=ORANGE, font=(sans, 8)
+        ).pack(pady=(18, 4))
 
         self.status_var = tk.StringVar(value="Home the motor to begin.")
 
-        ttk.Label(
-            self.menu_frame,
-            textvariable=self.status_var,
-            foreground="gray"
-        ).pack(pady=10)
+        tk.Label(
+            content, textvariable=self.status_var, bg=BG, fg=DISABLED,
+            font=(sans, 9)
+        ).pack()
 
     # =========================================
     # GAME SCREEN
@@ -247,41 +561,67 @@ class CyclopsInterface:
 
     def build_game_screen(self):
 
-        self.game_frame = ttk.Frame(self.root)
+        serif = self._results_serif
+        sans = self._results_sans
+
+        self.game_frame = tk.Frame(self.root, bg=BG)
 
         # -------------------------------------
-        # Player list (across the top)
+        # Bottom bar: player list, controls, key hints
         # -------------------------------------
 
-        panel = ttk.Frame(self.game_frame, padding=(15, 10))
-        panel.pack(side="top", fill="x")
+        bar = tk.Frame(self.game_frame, bg=BG, padx=15, pady=10)
+        bar.pack(side="bottom", fill="x")
 
-        players_bar = ttk.Frame(panel)
+        players_bar = tk.Frame(bar, bg=BG)
         players_bar.pack(side="top")
 
         self.player_rows = [
-            self.make_player_row(players_bar, font_size=14, horizontal=True)
+            self.make_player_row(players_bar, font_size=14, horizontal=True,
+                                 themed=True)
             for _ in range(self.num_players)
         ]
 
-        ttk.Label(
-            panel,
-            text=(
-                f"Press 1-{self.num_players} to mark a player as survived.   "
-                f"While a snapshot is shown, press 1-{self.num_players} "
-                "to eliminate that player."
-            ),
-            foreground="gray"
-        ).pack(side="top", pady=(4, 0))
+        controls = tk.Frame(bar, bg=BG)
+        controls.pack(side="top", pady=(8, 4))
+
+        # Lobby only: starts the real game once everyone is lined up
+        self.ready_button = HexButton(
+            controls, "ALL PLAYERS READY", self.all_players_ready,
+            width=230, height=38, font=(serif, 12), diamonds=True
+        )
+
+        self.continue_button = HexButton(
+            controls, "CONTINUE", self.continue_game,
+            width=170, height=38, font=(serif, 12), diamonds=True,
+            state="disabled"
+        )
+
+        self.end_button = HexButton(
+            controls, "END GAME", self.end_game,
+            width=170, height=38, font=(serif, 12)
+        )
+
+        self.game_hint_var = tk.StringVar()
+
+        tk.Label(
+            bar,
+            textvariable=self.game_hint_var,
+            bg=BG, fg=MUTED, font=(sans, 8)
+        ).pack(side="top")
+
+        self.show_game_controls(lobby=False)
 
         # -------------------------------------
-        # Camera display
+        # Camera display (title and player outlines are drawn onto it)
         # -------------------------------------
 
-        self.camera_label = ttk.Label(self.game_frame, anchor="center")
+        self.camera_label = tk.Label(
+            self.game_frame, bg=BG, bd=0, anchor="center"
+        )
 
         self.camera_label.pack(
-            side="left",
+            side="top",
             fill="both",
             expand=True
         )
@@ -292,35 +632,39 @@ class CyclopsInterface:
             self.resize_camera
         )
 
-        # -------------------------------------
-        # Overlay controls
-        # -------------------------------------
+    def show_game_controls(self, lobby):
+        """Lobby: [All Players Ready][End Game]. Game: [Continue][End Game]."""
 
-        self.controls = ttk.Frame(
-            self.camera_label,
-            padding=10
-        )
+        for button in (self.ready_button, self.continue_button,
+                       self.end_button):
+            button.pack_forget()
 
-        self.controls.place(
-            relx=0.5,
-            y=15,
-            anchor="n"
-        )
+        first = self.ready_button if lobby else self.continue_button
+        first.pack(side="left", padx=6)
+        self.end_button.pack(side="left", padx=6)
 
-        self.continue_button = ttk.Button(
-            self.controls,
-            text="Continue Game",
-            command=self.continue_game,
-            state="disabled"
-        )
-        self.continue_button.pack(side="left", padx=5)
+        if lobby:
+            self.game_hint_var.set(
+                "LINE UP SO EVERY PLAYER HAS AN OUTLINE, "
+                "THEN PRESS ALL PLAYERS READY TO START"
+            )
+        else:
+            self.game_hint_var.set(
+                f"PRESS 1-{self.num_players} TO MARK A PLAYER AS SURVIVED"
+                "   ·   "
+                f"WHILE A SNAPSHOT IS SHOWN, PRESS 1-{self.num_players} "
+                "TO ELIMINATE THAT PLAYER"
+            )
 
-        self.end_button = ttk.Button(
-            self.controls,
-            text="End Game",
-            command=self.end_game
-        )
-        self.end_button.pack(side="left", padx=5)
+    def all_players_ready(self):
+        """Everyone is lined up: leave the lobby and start the game."""
+
+        if not self.in_lobby or not self.game_running:
+            return
+
+        self.in_lobby = False
+        self.ready_event.set()
+        self.show_game_controls(lobby=False)
 
     # =========================================
     # RESULTS SCREEN
@@ -328,63 +672,108 @@ class CyclopsInterface:
 
     def build_results_screen(self):
 
-        self.results_frame = ttk.Frame(self.root, padding=30)
+        serif = self._results_serif
+        sans = self._results_sans
 
-        ttk.Label(
-            self.results_frame,
-            text="Game Over",
-            font=("Segoe UI", 32, "bold")
+        # Dark scrollbar borrowed from the "clam" theme so the rest of the
+        # app keeps its native look.
+        style = ttk.Style(self.root)
+        for element in ("trough", "thumb"):
+            try:
+                style.element_create(
+                    f"Dark.Horizontal.Scrollbar.{element}", "from", "clam"
+                )
+            except tk.TclError:
+                pass  # already created
+        style.layout("Dark.Horizontal.TScrollbar", [
+            ("Dark.Horizontal.Scrollbar.trough", {
+                "sticky": "we",
+                "children": [("Dark.Horizontal.Scrollbar.thumb",
+                              {"expand": "1", "sticky": "nswe"})]
+            })
+        ])
+        style.configure(
+            "Dark.Horizontal.TScrollbar",
+            troughcolor=BG, background=ORANGE, bordercolor=BG,
+            lightcolor=ORANGE, darkcolor=ORANGE, gripcount=0, arrowsize=6
+        )
+
+        self.results_frame = tk.Frame(self.root, bg=BG)
+
+        # Greek key borders, top and bottom
+        for side in ("top", "bottom"):
+            border = tk.Canvas(self.results_frame, height=32, bg=BG,
+                               highlightthickness=0)
+            border.pack(side=side, fill="x", padx=8, pady=8)
+            border.bind("<Configure>",
+                        lambda e, c=border: draw_greek_key(c, e))
+
+        content = tk.Frame(self.results_frame, bg=BG)
+        content.pack(side="top", fill="both", expand=True, padx=30)
+
+        tk.Label(
+            content, text="NOBODY'S WATCHING", bg=BG, fg=ORANGE,
+            font=(sans, 10, "bold")
+        ).pack(pady=(4, 6))
+
+        tk.Label(
+            content, text="GAME OVER", bg=BG, fg=CREAM,
+            font=(serif, 36, "bold")
         ).pack(pady=(0, 10))
 
-        box = ttk.LabelFrame(
-            self.results_frame,
-            text="Results",
-            padding=10
-        )
-        box.pack(pady=5)
+        box = tk.Frame(content, bg=BG)
+        box.pack(pady=(0, 6))
 
         self.result_rows = [
-            self.make_player_row(box, font_size=12, horizontal=True)
+            self.make_player_row(box, font_size=12, horizontal=True,
+                                 themed=True)
             for _ in range(self.num_players)
         ]
 
         # Button and graveyard are packed from the bottom up so the
         # snapshots sit at the bottom of the screen, above the button.
-        ttk.Button(
-            self.results_frame,
-            text="Return to Main Menu",
-            command=self.show_main_menu
-        ).pack(side="bottom", pady=(10, 0), ipadx=20, ipady=5)
+        HexButton(
+            content, "RETURN TO MAIN MENU", self.show_main_menu,
+            width=260, height=42, font=(serif, 13), diamonds=True
+        ).pack(side="bottom", pady=(12, 4))
 
         # -------------------------------------
         # Graveyard: snapshots from this game
         # -------------------------------------
 
-        graveyard = ttk.LabelFrame(
-            self.results_frame,
-            text="Graveyard",
-            padding=10
+        graveyard = tk.Frame(
+            content, bg=BG,
+            highlightthickness=1, highlightbackground=ORANGE,
+            padx=10, pady=8
         )
         # Expand into whatever vertical space is left so the thumbnails
         # can be sized to fit it.
-        graveyard.pack(side="bottom", pady=5, fill="both", expand=True)
+        graveyard.pack(side="bottom", pady=(14, 4), fill="both", expand=True)
+
+        tk.Label(
+            graveyard, text="GRAVEYARD", bg=BG, fg=ORANGE,
+            font=(serif, 14, "bold")
+        ).pack(side="top", pady=(0, 6))
 
         # Scrollbar packed first so it is never squeezed out by the canvas
-        graveyard_scroll = ttk.Scrollbar(graveyard, orient="horizontal")
-        graveyard_scroll.pack(side="bottom", fill="x")
+        graveyard_scroll = ttk.Scrollbar(
+            graveyard, orient="horizontal", style="Dark.Horizontal.TScrollbar"
+        )
+        graveyard_scroll.pack(side="bottom", fill="x", pady=(6, 0))
 
         # Small requested height: the canvas takes the leftover space
         # instead of pushing other widgets (and itself) off screen.
         self.graveyard_canvas = tk.Canvas(
             graveyard,
             height=1,
+            bg=BG,
             highlightthickness=0,
             xscrollcommand=graveyard_scroll.set
         )
         self.graveyard_canvas.pack(side="top", fill="both", expand=True)
         graveyard_scroll.configure(command=self.graveyard_canvas.xview)
 
-        self.graveyard_inner = ttk.Frame(self.graveyard_canvas)
+        self.graveyard_inner = tk.Frame(self.graveyard_canvas, bg=BG)
         self.graveyard_window = self.graveyard_canvas.create_window(
             (0, 0), window=self.graveyard_inner, anchor="nw"
         )
@@ -397,7 +786,8 @@ class CyclopsInterface:
     # Upper limit for thumbnail height; actual height shrinks to fit.
     GRAVEYARD_THUMB_HEIGHT = 700
     # Room reserved under each thumbnail for its "#n" caption.
-    GRAVEYARD_CAPTION_HEIGHT = 30
+    # (includes the 2px orange frame around each thumbnail)
+    GRAVEYARD_CAPTION_HEIGHT = 36
 
     def graveyard_thumb_height(self):
         """Thumbnail height that fits fully inside the graveyard canvas."""
@@ -452,10 +842,11 @@ class CyclopsInterface:
         self.graveyard_photos = []
 
         if not self.game_snapshots:
-            ttk.Label(
+            tk.Label(
                 self.graveyard_inner,
                 text="No snapshots this game.",
-                foreground="gray"
+                bg=BG, fg=DISABLED,
+                font=(self._results_serif, 12)
             ).pack(padx=5, pady=5)
             self.graveyard_canvas.xview_moveto(0)
             return
@@ -467,20 +858,28 @@ class CyclopsInterface:
             image = Image.fromarray(
                 cv2.cvtColor(snapshot, cv2.COLOR_BGR2RGB)
             )
+            if MIRROR_CAMERA:
+                image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
             w = max(1, int(image.width * h / image.height))
             image = image.resize((w, h), Image.Resampling.LANCZOS)
             photo = ImageTk.PhotoImage(image)
             self.graveyard_photos.append(photo)
 
-            cell = ttk.Frame(self.graveyard_inner)
-            cell.pack(side="left", padx=5)
-            ttk.Label(cell, image=photo).pack()
+            cell = tk.Frame(self.graveyard_inner, bg=BG)
+            cell.pack(side="left", padx=6)
+            tk.Label(
+                cell, image=photo, bg=BG, bd=0,
+                highlightthickness=2, highlightbackground=ORANGE
+            ).pack()
             players = self.game_snapshot_players[n - 1]
             caption = (
                 ", ".join(self.player_name(i) for i in players)
                 if players else f"#{n}"
             )
-            ttk.Label(cell, text=caption, foreground="gray").pack()
+            tk.Label(
+                cell, text=caption, bg=BG, fg=CREAM,
+                font=(self._results_serif, 12)
+            ).pack(pady=(4, 0))
 
         self.graveyard_canvas.xview_moveto(0)
 
@@ -513,29 +912,46 @@ class CyclopsInterface:
     # PLAYER LIST
     # =========================================
 
-    def make_player_row(self, parent, font_size, horizontal=False):
+    def make_player_row(self, parent, font_size, horizontal=False,
+                        themed=False):
         """A player name, a status label and a red strike line.
 
         With horizontal=True the entries sit side by side in a line.
+        With themed=True the row uses the dark "Nobody's Watching" palette.
         """
 
-        row = ttk.Frame(parent)
+        if themed:
+            row = tk.Frame(parent, bg=BG)
+        else:
+            row = ttk.Frame(parent)
         if horizontal:
             row.pack(side="left", padx=12, pady=2)
         else:
             row.pack(anchor="w", fill="x", pady=4)
 
-        name_label = tk.Label(row, font=("Segoe UI", font_size))
+        if themed:
+            name_label = tk.Label(
+                row, bg=BG, fg=CREAM,
+                font=(self._results_serif, font_size + 1)
+            )
+            status_label = tk.Label(
+                row, bg=BG, font=(self._results_serif, font_size - 1, "bold")
+            )
+            # (survived colour, eliminated colour)
+            status_label.status_colors = (SURVIVED, RED)
+            strike = tk.Frame(row, bg=RED, height=2)
+        else:
+            name_label = tk.Label(row, font=("Segoe UI", font_size))
+            status_label = ttk.Label(
+                row,
+                font=("Segoe UI", font_size, "bold")
+            )
+            status_label.status_colors = ("green", "red")
+            # Single red line drawn through the name when eliminated
+            strike = tk.Frame(row, bg="red", height=2)
+
         name_label.pack(side="left")
-
-        status_label = ttk.Label(
-            row,
-            font=("Segoe UI", font_size, "bold")
-        )
         status_label.pack(side="left", padx=(10, 0))
-
-        # Single red line drawn through the name when eliminated
-        strike = tk.Frame(row, bg="red", height=2)
 
         return name_label, status_label, strike
 
@@ -549,8 +965,11 @@ class CyclopsInterface:
         for i, (name_label, status_label, strike) in enumerate(rows):
             name_label.config(text=f"{i + 1}. {self.player_name(i)}")
 
+            survived_color, eliminated_color = status_label.status_colors
+
             if self.eliminated[i]:
-                status_label.config(text="Eliminated", foreground="red")
+                status_label.config(text="Eliminated",
+                                    foreground=eliminated_color)
                 strike.place(
                     in_=name_label,
                     relx=0, rely=0.5, relwidth=1,
@@ -558,7 +977,8 @@ class CyclopsInterface:
                 )
                 strike.lift()
             elif self.survived[i]:
-                status_label.config(text="Survived", foreground="green")
+                status_label.config(text="Survived",
+                                    foreground=survived_color)
                 strike.place_forget()
             else:
                 status_label.config(text="")
@@ -575,6 +995,10 @@ class CyclopsInterface:
             return
 
         if not event.char or not event.char.isdigit():
+            return
+
+        # Nobody can survive or be eliminated before the game starts
+        if self.in_lobby:
             return
 
         index = int(event.char) - 1
@@ -613,9 +1037,13 @@ class CyclopsInterface:
     def resize_camera(self, event=None):
 
         if self.latest_frame is not None:
-            self.display_frame(self.latest_frame)
+            self.display_frame(
+                self.latest_frame,
+                None if self.snapshot_showing else self.latest_overlay,
+                snapshot=self.snapshot_showing
+            )
 
-    def display_frame(self, frame):
+    def display_frame(self, frame, overlay=None, snapshot=False):
 
         width = self.camera_label.winfo_width()
         height = self.camera_label.winfo_height()
@@ -630,11 +1058,22 @@ class CyclopsInterface:
         )
 
         image = Image.fromarray(frame_rgb)
+        frame_w, frame_h = image.size
+
+        # Mirror so players' left/right match what they see on screen.
+        # Detection runs on the unmirrored frame, so flip the overlay too.
+        if MIRROR_CAMERA:
+            image = image.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            overlay = mirror_overlay(overlay, frame_w)
 
         # Stretch image to fill entire camera widget
         image = image.resize(
             (width, height),
             Image.Resampling.LANCZOS
+        )
+
+        self.draw_camera_overlay(
+            image, overlay, width / frame_w, height / frame_h, snapshot
         )
 
         photo = ImageTk.PhotoImage(image)
@@ -646,6 +1085,164 @@ class CyclopsInterface:
 
         # Keep reference to prevent garbage collection
         self.camera_photo = photo
+
+    # =========================================
+    # CAMERA OVERLAY (Figma "Step into the frame" style)
+    # =========================================
+
+    def slot_for_track(self, track_id, now):
+        """Stable P1/P2/... slot for a tracker ID while it stays visible."""
+
+        # Forget tracks that have not been seen for a while
+        for tid in [t for t, (_, seen) in self.track_slots.items()
+                    if now - seen > 2.0]:
+            del self.track_slots[tid]
+
+        if track_id in self.track_slots:
+            slot = self.track_slots[track_id][0]
+        else:
+            used = {s for s, _ in self.track_slots.values()}
+            slot = next(i for i in range(len(used) + 1) if i not in used)
+        self.track_slots[track_id] = [slot, now]
+        return slot
+
+    def draw_camera_overlay(self, image, overlay, sx, sy, snapshot):
+        """Draw title, ROI, player outlines and stats onto the camera image."""
+
+        w, h = image.size
+        draw = ImageDraw.Draw(image)
+
+        playing = bool(overlay and overlay.get("playing", True))
+
+        # Lobby: title at the top. Live game: no title, so nothing covers
+        # the players. Snapshot: "Caught moving" at the bottom centre so the
+        # caught player's face stays visible.
+        show_title = snapshot or not playing
+        title_at_bottom = snapshot
+
+        # Dark fade behind the title so it reads over the camera
+        # (drawn first so outlines and labels stay bright on top of it)
+        shade_h = max(1, int(h * 0.32))
+        if not show_title:
+            pass
+        elif title_at_bottom:
+            image.paste(
+                BG, (0, h - shade_h, w, h),
+                top_shade_mask(w, shade_h).transpose(
+                    Image.Transpose.FLIP_TOP_BOTTOM
+                )
+            )
+        else:
+            image.paste(BG, (0, 0, w, shade_h), top_shade_mask(w, shade_h))
+
+        if overlay and not snapshot:
+
+            # Dim everything outside the eye's detection zone
+            # (no zone in the lobby: the eye isn't watching yet)
+            if overlay.get("roi"):
+                rx1, _, rx2, _ = overlay["roi"]
+                rx1, rx2 = int(rx1 * sx), int(rx2 * sx)
+                for box in ((0, 0, rx1, h), (rx2, 0, w, h)):
+                    if box[2] - box[0] > 0:
+                        region = image.crop(box)
+                        image.paste(
+                            Image.blend(region,
+                                        Image.new("RGB", region.size, BG),
+                                        0.55),
+                            box
+                        )
+                draw.line((rx1, 0, rx1, h), fill=ORANGE, width=2)
+                draw.line((rx2, 0, rx2, h), fill=ORANGE, width=2)
+
+            # Player outlines with a pill label above each one
+            now = time.monotonic()
+            pill_font = load_font(tuple(BOLD_FONT_FILES),
+                                  max(14, int(h * 0.026)))
+            for track_id, (x1, y1, x2, y2), state in overlay["people"]:
+                slot = self.slot_for_track(track_id, now)
+                color = PLAYER_COLORS[slot % len(PLAYER_COLORS)]
+
+                pad = 8
+                box = (int(x1 * sx) - pad, int(y1 * sy) - pad,
+                       int(x2 * sx) + pad, int(y2 * sy) + pad)
+
+                if state == "MOVING":
+                    line_color, text = RED, f"P{slot + 1} MOVING"
+                elif state == "STATIONARY":
+                    # "READY" only makes sense in the lobby
+                    line_color = color
+                    text = f"P{slot + 1}" if playing else f"P{slot + 1} READY"
+                else:
+                    line_color, text = color, f"P{slot + 1}"
+
+                draw_dashed_rounded_rect(
+                    draw, box, radius=int(min(w, h) * 0.03),
+                    color=line_color, width=4
+                )
+
+                left, top, right, bottom = draw.textbbox(
+                    (0, 0), text, font=pill_font
+                )
+                pw = (right - left) + 2 * int(pill_font.size * 1.6)
+                ph = (bottom - top) + int(pill_font.size * 1.0)
+                cx = (box[0] + box[2]) / 2
+                py2 = box[1] - 10
+                if py2 - ph < 0:          # no room above: tuck inside
+                    py2 = box[1] + 10 + ph
+                pill = (cx - pw / 2, py2 - ph, cx + pw / 2, py2)
+
+                if state in ("MOVING", "STATIONARY"):
+                    draw.rounded_rectangle(pill, radius=ph / 2,
+                                           fill=line_color)
+                    text_color = INK
+                else:  # still being assessed: outlined pill
+                    draw.rounded_rectangle(pill, radius=ph / 2, fill=PANEL,
+                                           outline=line_color, width=2)
+                    text_color = line_color
+                draw_centered_text(draw, cx, pill[1] + (ph - (bottom - top)) / 2,
+                                   text, pill_font, text_color)
+
+        if snapshot:
+            title = "CAUGHT MOVING"
+            subtitle = (f"Press 1-{self.num_players} to eliminate the player, "
+                        "then Continue")
+        else:
+            title = "STEP INTO THE FRAME"
+            subtitle = "Stand inside your outline and hold still"
+
+        if show_title:
+            self.draw_overlay_title(draw, w, h, title, subtitle,
+                                    title_at_bottom)
+
+        # Small grey stats in the top-right corner
+        if overlay and not snapshot:
+            stats = (f"MOTOR {overlay['motor']:.1f}°   "
+                     f"PEOPLE {overlay['count']}/{overlay['max_people']}")
+            small = load_font(tuple(BODY_FONT_FILES), max(11, int(h * 0.018)))
+            left, top, right, bottom = draw.textbbox((0, 0), stats, font=small)
+            draw.text((w - 24 - (right - left), 20 - top), stats,
+                      font=small, fill=MUTED)
+
+    def draw_overlay_title(self, draw, w, h, title, subtitle, at_bottom):
+        """Big Cinzel title + subtitle, centred at the top or bottom."""
+
+        title_font = load_font(tuple(TITLE_FONT_FILES),
+                               max(24, int(h * 0.075)))
+        body_font = load_font(tuple(BODY_FONT_FILES),
+                              max(13, int(h * 0.03)))
+        gap = int(h * 0.025)
+        if at_bottom:
+            # Measure first so the subtitle sits just above the bottom edge
+            _, t_top, _, t_bottom = draw.textbbox((0, 0), title,
+                                                  font=title_font)
+            _, s_top, _, s_bottom = draw.textbbox((0, 0), subtitle,
+                                                  font=body_font)
+            y = (h - int(h * 0.05) - (s_bottom - s_top) - gap
+                 - (t_bottom - t_top))
+        else:
+            y = int(h * 0.06)
+        y += draw_centered_text(draw, w / 2, y, title, title_font, CREAM)
+        draw_centered_text(draw, w / 2, y + gap, subtitle, body_font, CREAM)
 
     # =========================================
     # MOTOR HOMING
@@ -700,6 +1297,11 @@ class CyclopsInterface:
         self.stop_event.clear()
         self.continue_event.set()
 
+        # Start in the "Step into the frame" lobby
+        self.ready_event.clear()
+        self.in_lobby = True
+        self.show_game_controls(lobby=True)
+
         # Fresh game: nobody has survived yet, no old frames
         self.survived = [False] * self.num_players
         self.eliminated = [False] * self.num_players
@@ -708,6 +1310,8 @@ class CyclopsInterface:
         self.game_snapshot_players = []
         self.current_snapshot = None
         self.latest_frame = None
+        self.latest_overlay = None
+        self.track_slots = {}
         self.camera_photo = None
         self.camera_label.configure(image="")
 
@@ -724,7 +1328,8 @@ class CyclopsInterface:
                 self.stop_event,
                 self.continue_event,
                 self.frame_queue,
-                self.messages
+                self.messages,
+                self.ready_event
             ),
             daemon=True
         )
@@ -745,6 +1350,7 @@ class CyclopsInterface:
     def stop_game(self):
 
         self.stop_event.set()
+        self.in_lobby = False
 
         # Release game if it is paused
         self.continue_event.set()
@@ -793,11 +1399,13 @@ class CyclopsInterface:
 
         try:
 
-            frame = self.frame_queue.get_nowait()
+            frame, overlay = self.frame_queue.get_nowait()
 
-            self.latest_frame = frame
-
-            self.display_frame(frame)
+            # While a snapshot is on screen, keep it there
+            if not self.snapshot_showing:
+                self.latest_frame = frame
+                self.latest_overlay = overlay
+                self.display_frame(frame, overlay)
 
         except queue.Empty:
             pass
@@ -830,7 +1438,7 @@ class CyclopsInterface:
                     self.snapshot_showing = True
 
                     # Display snapshot in centre
-                    self.display_frame(snapshot)
+                    self.display_frame(snapshot, snapshot=True)
 
                     # Boom!
                     play_boom()
