@@ -129,7 +129,10 @@ def main(motor, stop_event, continue_event, frame_queue, messages):
 
     motor_position = 0
     last_motor_read = 0
-    motor_stopped = False
+    # Start as "stopped" so the first loop iteration always issues a move.
+    # A previous game ends with MST mid-move, which leaves the
+    # position-reached flag at 0 and would otherwise stall the motor.
+    motor_stopped = True
 
     def send_frame(frame):
         """Keep only the newest live camera frame in the queue."""

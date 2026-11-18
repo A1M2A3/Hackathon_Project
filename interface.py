@@ -139,6 +139,14 @@ class CyclopsInterface:
         # True while a snapshot is on screen (game paused on a detection)
         self.snapshot_showing = False
 
+        # Snapshots taken during the current game (shown in the graveyard)
+        self.game_snapshots = []
+        # Player indices eliminated on each snapshot (parallel list)
+        self.game_snapshot_players = []
+        # Index into game_snapshots of the snapshot currently on screen
+        self.current_snapshot = None
+        self.graveyard_photos = []
+
         self.build_main_menu()
         self.build_game_screen()
         self.build_results_screen()
@@ -184,18 +192,20 @@ class CyclopsInterface:
         )
         players_box.pack(pady=10)
 
+        # Names laid out horizontally: "1. [entry]  2. [entry] ..."
         for i, var in enumerate(self.name_vars, start=1):
             ttk.Label(
                 players_box,
                 text=f"{i}.",
                 font=("Segoe UI", 12)
-            ).grid(row=i, column=0, padx=(0, 8), pady=3, sticky="e")
+            ).grid(row=0, column=2 * (i - 1), padx=(10 if i > 1 else 0, 4),
+                   pady=3, sticky="e")
 
             ttk.Entry(
                 players_box,
                 textvariable=var,
-                width=25
-            ).grid(row=i, column=1, pady=3)
+                width=15
+            ).grid(row=0, column=2 * (i - 1) + 1, pady=3)
 
         # Menu buttons
         buttons = ttk.Frame(self.menu_frame)
@@ -240,33 +250,29 @@ class CyclopsInterface:
         self.game_frame = ttk.Frame(self.root)
 
         # -------------------------------------
-        # Player list (right side)
+        # Player list (across the top)
         # -------------------------------------
 
-        panel = ttk.Frame(self.game_frame, padding=15)
-        panel.pack(side="right", fill="y")
+        panel = ttk.Frame(self.game_frame, padding=(15, 10))
+        panel.pack(side="top", fill="x")
 
-        ttk.Label(
-            panel,
-            text="Players",
-            font=("Segoe UI", 16, "bold")
-        ).pack(anchor="w", pady=(0, 10))
+        players_bar = ttk.Frame(panel)
+        players_bar.pack(side="top")
 
         self.player_rows = [
-            self.make_player_row(panel, font_size=14)
+            self.make_player_row(players_bar, font_size=14, horizontal=True)
             for _ in range(self.num_players)
         ]
 
         ttk.Label(
             panel,
             text=(
-                f"Press 1-{self.num_players} to mark a player as survived.\n\n"
+                f"Press 1-{self.num_players} to mark a player as survived.   "
                 f"While a snapshot is shown, press 1-{self.num_players} "
                 "to eliminate that player."
             ),
-            wraplength=180,
             foreground="gray"
-        ).pack(side="bottom", anchor="w")
+        ).pack(side="top", pady=(4, 0))
 
         # -------------------------------------
         # Camera display
@@ -328,25 +334,155 @@ class CyclopsInterface:
             self.results_frame,
             text="Game Over",
             font=("Segoe UI", 32, "bold")
-        ).pack(pady=(40, 20))
+        ).pack(pady=(0, 10))
 
         box = ttk.LabelFrame(
             self.results_frame,
             text="Results",
-            padding=15
+            padding=10
         )
-        box.pack(pady=10)
+        box.pack(pady=5)
 
         self.result_rows = [
-            self.make_player_row(box, font_size=18)
+            self.make_player_row(box, font_size=12, horizontal=True)
             for _ in range(self.num_players)
         ]
 
+        # Button and graveyard are packed from the bottom up so the
+        # snapshots sit at the bottom of the screen, above the button.
         ttk.Button(
             self.results_frame,
             text="Return to Main Menu",
             command=self.show_main_menu
-        ).pack(pady=30, ipadx=20, ipady=5)
+        ).pack(side="bottom", pady=(10, 0), ipadx=20, ipady=5)
+
+        # -------------------------------------
+        # Graveyard: snapshots from this game
+        # -------------------------------------
+
+        graveyard = ttk.LabelFrame(
+            self.results_frame,
+            text="Graveyard",
+            padding=10
+        )
+        # Expand into whatever vertical space is left so the thumbnails
+        # can be sized to fit it.
+        graveyard.pack(side="bottom", pady=5, fill="both", expand=True)
+
+        # Scrollbar packed first so it is never squeezed out by the canvas
+        graveyard_scroll = ttk.Scrollbar(graveyard, orient="horizontal")
+        graveyard_scroll.pack(side="bottom", fill="x")
+
+        # Small requested height: the canvas takes the leftover space
+        # instead of pushing other widgets (and itself) off screen.
+        self.graveyard_canvas = tk.Canvas(
+            graveyard,
+            height=1,
+            highlightthickness=0,
+            xscrollcommand=graveyard_scroll.set
+        )
+        self.graveyard_canvas.pack(side="top", fill="both", expand=True)
+        graveyard_scroll.configure(command=self.graveyard_canvas.xview)
+
+        self.graveyard_inner = ttk.Frame(self.graveyard_canvas)
+        self.graveyard_window = self.graveyard_canvas.create_window(
+            (0, 0), window=self.graveyard_inner, anchor="nw"
+        )
+        self.graveyard_inner.bind("<Configure>", self.center_graveyard)
+        self.graveyard_canvas.bind("<Configure>", self.on_graveyard_resize)
+
+        self._graveyard_thumb_h = None
+        self._graveyard_resize_job = None
+
+    # Upper limit for thumbnail height; actual height shrinks to fit.
+    GRAVEYARD_THUMB_HEIGHT = 700
+    # Room reserved under each thumbnail for its "#n" caption.
+    GRAVEYARD_CAPTION_HEIGHT = 30
+
+    def graveyard_thumb_height(self):
+        """Thumbnail height that fits fully inside the graveyard canvas."""
+
+        canvas_h = self.graveyard_canvas.winfo_height()
+        if canvas_h <= 1:
+            return self.GRAVEYARD_THUMB_HEIGHT
+        return max(
+            20,
+            min(
+                self.GRAVEYARD_THUMB_HEIGHT,
+                canvas_h - self.GRAVEYARD_CAPTION_HEIGHT
+            )
+        )
+
+    def on_graveyard_resize(self, event=None):
+        """Re-fit thumbnails when the graveyard's height changes (debounced)."""
+
+        self.center_graveyard()
+
+        if self._graveyard_thumb_h == self.graveyard_thumb_height():
+            return
+        if self._graveyard_resize_job is not None:
+            self.root.after_cancel(self._graveyard_resize_job)
+        self._graveyard_resize_job = self.root.after(
+            60, self._apply_graveyard_resize
+        )
+
+    def _apply_graveyard_resize(self):
+
+        self._graveyard_resize_job = None
+        if self.game_snapshots:
+            self.refresh_graveyard()
+
+    def center_graveyard(self, event=None):
+        """Keep the thumbnails centred; scroll only when they overflow."""
+
+        canvas_w = self.graveyard_canvas.winfo_width()
+        inner_w = self.graveyard_inner.winfo_reqwidth()
+        inner_h = self.graveyard_inner.winfo_reqheight()
+        x = max(0, (canvas_w - inner_w) // 2)
+        self.graveyard_canvas.coords(self.graveyard_window, x, 0)
+        self.graveyard_canvas.configure(
+            scrollregion=(0, 0, max(canvas_w, inner_w), inner_h)
+        )
+
+    def refresh_graveyard(self):
+        """Rebuild the graveyard thumbnails from this game's snapshots."""
+
+        for child in self.graveyard_inner.winfo_children():
+            child.destroy()
+        self.graveyard_photos = []
+
+        if not self.game_snapshots:
+            ttk.Label(
+                self.graveyard_inner,
+                text="No snapshots this game.",
+                foreground="gray"
+            ).pack(padx=5, pady=5)
+            self.graveyard_canvas.xview_moveto(0)
+            return
+
+        h = self.graveyard_thumb_height()
+        self._graveyard_thumb_h = h
+
+        for n, snapshot in enumerate(self.game_snapshots, start=1):
+            image = Image.fromarray(
+                cv2.cvtColor(snapshot, cv2.COLOR_BGR2RGB)
+            )
+            w = max(1, int(image.width * h / image.height))
+            image = image.resize((w, h), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(image)
+            self.graveyard_photos.append(photo)
+
+            cell = ttk.Frame(self.graveyard_inner)
+            cell.pack(side="left", padx=5)
+            ttk.Label(cell, image=photo).pack()
+            players = self.game_snapshot_players[n - 1]
+            caption = (
+                ", ".join(self.player_name(i) for i in players)
+                if players else f"#{n}"
+            )
+            ttk.Label(cell, text=caption, foreground="gray").pack()
+
+        self.graveyard_canvas.xview_moveto(0)
 
     # =========================================
     # SCREEN SWITCHING
@@ -370,17 +506,24 @@ class CyclopsInterface:
         self.game_frame.pack_forget()
         self.menu_frame.pack_forget()
         self.refresh_rows(self.result_rows)
+        self.refresh_graveyard()
         self.results_frame.pack(fill="both", expand=True)
 
     # =========================================
     # PLAYER LIST
     # =========================================
 
-    def make_player_row(self, parent, font_size):
-        """A row with a player name, a status label and a red strike line."""
+    def make_player_row(self, parent, font_size, horizontal=False):
+        """A player name, a status label and a red strike line.
+
+        With horizontal=True the entries sit side by side in a line.
+        """
 
         row = ttk.Frame(parent)
-        row.pack(anchor="w", fill="x", pady=4)
+        if horizontal:
+            row.pack(side="left", padx=12, pady=2)
+        else:
+            row.pack(anchor="w", fill="x", pady=4)
 
         name_label = tk.Label(row, font=("Segoe UI", font_size))
         name_label.pack(side="left")
@@ -444,6 +587,15 @@ class CyclopsInterface:
             self.eliminated[index] = not self.eliminated[index]
             if self.eliminated[index]:
                 self.survived[index] = False
+                # Remember which snapshot caught this player
+                if self.current_snapshot is not None:
+                    self.game_snapshot_players[self.current_snapshot].append(
+                        index
+                    )
+            else:
+                for players in self.game_snapshot_players:
+                    if index in players:
+                        players.remove(index)
         else:
             self.survived[index] = not self.survived[index]
             if self.survived[index]:
@@ -552,6 +704,9 @@ class CyclopsInterface:
         self.survived = [False] * self.num_players
         self.eliminated = [False] * self.num_players
         self.snapshot_showing = False
+        self.game_snapshots = []
+        self.game_snapshot_players = []
+        self.current_snapshot = None
         self.latest_frame = None
         self.camera_photo = None
         self.camera_label.configure(image="")
@@ -662,6 +817,15 @@ class CyclopsInterface:
 
                     snapshot = message[1]
 
+                    # Keep it for the graveyard (ignore stragglers that
+                    # arrive after the game was stopped)
+                    if self.game_running and not self.stop_event.is_set():
+                        self.game_snapshots.append(snapshot.copy())
+                        self.game_snapshot_players.append([])
+                        self.current_snapshot = len(self.game_snapshots) - 1
+                    else:
+                        self.current_snapshot = None
+
                     self.latest_frame = snapshot
                     self.snapshot_showing = True
 
@@ -727,8 +891,9 @@ class CyclopsInterface:
                     state="disabled"
                 )
 
+                # Homing only needs to happen once per session
                 self.home_button.config(
-                    state="normal"
+                    state="disabled" if self.motor_homed else "normal"
                 )
 
                 self.start_button.config(
